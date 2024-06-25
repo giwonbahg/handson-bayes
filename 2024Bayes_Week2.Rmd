@@ -1,0 +1,353 @@
+---
+title: "Bayes Workshop Week 2"
+output:
+  html_notebook: default
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+```{r}
+library("rstan")
+library("loo")
+library("bridgesampling")
+```
+
+# Model Comparison in Bayesian Inference
+
+Last week, we discussed a mean comparison case in which two groups had clearly different variances. Our very first model in Stan assumed a shared variance between the two groups. The posterior estimate of the common variance was located between the "ground truth" variances (posterior mean $\approx$ 0.75).
+
+Our first model is already suspicious because we know the data generation process. In reality, however, we will never know the truth. Two groups sharing the same variance is a quite strong assumption, considering this concern. This week, we will compare models with different variance assumptions and evaluate which explains data better.
+
+Within a Bayesian framework, two major approaches for model comparison exists: (1) a Bayes factor, and (2) posterior predictive model assessment. The latter is not exclusively Bayesian, the Bayesian framework provides a unique interpretation.
+
+-   **Bayes factor**: The expected probability of observing data, given the model defined by its parameters
+-   **Posterior predictive model assessment:** Estimate out-of-sample predictive accuracy using within-sample fits
+    -   **Information criterion**: [*W*]{.underline}*atanabe-[A]{.underline}kaike [i]{.underline}nformation [c]{.underline}riterion* (WAIC; a.k.a. *Widely applicable information criterion*)
+    -   **Cross-validation**: [*P*]{.underline}*areto-[s]{.underline}moothed [i]{.underline}nformation [s]{.underline}ampling cross-validation* (PSIS) as an approximation of leave-one-out cross-validation
+
+## Before starting...
+
+This week's topic is quite technical. I tried my best to avoid making this note too complicated, but you might want to check some references to study more details. Please check the following materials.
+
+-   **Chapter 7** from McElreath, R. (2020). *Statistical Rethinking* (2nd ed). CRC Press.
+
+-   **Chapter 7** from Lee, M. D., & Wagenmakers, E.-J. (2013). Bayesian Cognitive Modeling: A Practical Course. Cambridge University Press.
+
+-   **Chapter 7** from Gelman, A., Carlin, J. B., Stern, H. S., Dunson, D. B., Vehtari, A., & Rubin, D. B. (2013). *Bayesian Data Analysis* (3rd ed). CRC Press.
+
+-   Gronau, Q. F., Sarafoglou, A., Matzke, D., Ly, A., Boehm, U., Marsman, M., Leslie, D. S., Forster, J. J., Wagenmakers, E.-J., & Steingroever, H. (2017). A tutorial on bridge sampling. *Journal of Mathematical Psychology*, *81*, 80-97.
+
+-   Gronau, Q. F., Singmann, H., & Wagenmakers, E.-J. (2018). bridgesampling: An R package for estimating normalizing constants. arXiv:1710.08162v3.
+
+-   Vehtari, A., Gelman, A., & Gabry, J. (2017). Practical Bayesian model evaluation using leave-one-out cross-validation and WAIC. *Statistics and Computing*, *27*, 1413-1432.
+
+You might also be interested in...
+
+-   **Chapter 10** from Kruschke, J. K. (2015). Doing *Bayesian Data Analysis* (2nd ed). Academic Press.
+
+-   [Journal of Mathematical Psychology: A special issue on Bayes factors](https://www.sciencedirect.com/journal/journal-of-mathematical-psychology/vol/72/suppl/C)
+
+-   Haaf, J. M., Klaassen, F., & Rouder, J. N. (2020). Bayes factor vs. posterior-predictive model assessment: Insights from ordinal constraints. [PsyArXiv](https://osf.io/preprints/psyarxiv/e6g9d)
+
+## Bayes factor
+
+Let's recall the Bayes' theorem: $$p(\theta | \mathbf{y}) = \frac{p(\mathbf{y}|\theta)p(\theta)}{\int p(\mathbf{y}|\theta)p(\theta)d\theta}.$$ (We will omit the parameter space notation for the integral symbol for simplicity.) Parameters $\theta$ are determined by the model we use. In this sense, we can rewrite the Bayes' theorem considering the model of our interest, $M$:$$p(\theta | \mathbf{y}, M) = \frac{p(\mathbf{y}|\theta, M)p(\theta | M)}{\int p(\mathbf{y}|\theta, M)p(\theta | M)d\theta}.$$
+
+The denominator can be simplified as a marginal probability of data, and therefore, **marginal likelihood**: $$\int p(\mathbf{y}|\theta,M)p(\theta | M)d\theta = \int p(\mathbf{y}, \theta | M)d\theta = p(\mathbf{y}|M).$$ This quantity $p(\mathbf{y}|M)$ means the probability of observing data $\mathbf{y}$ assuming that $M$ is a data-generating model. If this probability is high enough, we can say that $M$ is supported by data $\mathbf{y}$.
+
+### Multiple candidate models
+
+Let's say we have two candidate models in our consideration, $M_1$ (e.g., the homogeneous-variance model) and $M_2$ (e.g., the heterogeneous-variance model). As we did for parameters, we can also assign prior probabilities to candidate models, i.e., $p(M_1)$ and $p(M_2)$.
+
+Following the same logic of the Bayes' theorem, we can update our knowledge about the model probability: $$\underbrace{p(M_i | \mathbf{y})}_{\text{model posterior}} = \frac{\overbrace{p(\mathbf{y}|M_i)}^{\text{marginal likelihood}}\overbrace{p(M_i)}^{\text{model prior}}}{p(\mathbf{y}|M_1)p(M_1) + p(\mathbf{y}|M_2)p(M_2)},\qquad i=1\text{ or }2.$$
+
+How can we determine which model is better between the two? We can simply take the ratio of the model posterior to evaluate the relative plausibility of the candidate models: $$\underbrace{\frac{p(M_1 | \mathbf{y})}{p(M_2 | \mathbf{y})}}_{\text{model posterior odds}} = \overbrace{\frac{p(\mathbf{y} | M_1)}{p(\mathbf{y} | M_2)}}^{\text{Bayes factor}} \underbrace{\frac{p(M_1)}{p(M_2)}}_{\text{model prior odds}}.$$
+
+The Bayes factor is considered a quantity that compares the model-supporting evidence between different candidate models.
+
+### Bridge sampling
+
+Bayes factors are broadly used for model comparison, but they are difficult to compute in reality. You need to compute the marginal likelihood $\int p(\mathbf{y}|\theta, M) p(\theta | M)d\theta$, but only a few cases have closed-form, analytic solutions. In general, numerical approximation based on Monte Carlo simulation is the best that you can expect.
+
+How can you compute the marginal likelihood using random samples? Imagine a simpler case: If you want to compute the expected value of a random variable $X$ (or its transformation $f(X)$) following a certain distribution $p$, you can draw many samples from the target distribution and take the average (**Monte Carlo integration**): $$\mathbb{E}_p[f(X)] \approx \frac{1}{S}\sum_{i=1}^Sf(x_i),\qquad x_i \sim p$$
+
+```{r}
+# 1. Want to compute the expected value of X ~ N(2, 0.5)
+xs = rnorm(10000, 2, 0.5)
+EX = 1/ length(xs) * sum(xs) # or simply, mean(xs)
+print(paste("E(X) =", EX))
+
+# 2. Want to compute the expected value of X^2, given that X ~ N(2, 0.5)
+EX2 = 1 / length(xs) * sum(xs^2) # or simply, mean(xs^2)
+print(paste("E(X^2) =", EX2))
+
+# Sanity check:
+# We're not sure wheter (2) worked well just because we don't usually think about E(X^2).
+# Did our approach work in (2)?
+# If so, Var(X) = E(X^2) - E(X)^2 must be close to 0.5^2.
+VX = EX2 - EX^2
+print(paste("Var(X) =", VX))
+print(paste("SD(X) =", sqrt(VX)))
+```
+
+Marginal distribution is the expected value of the probability of observing data, given that model parameters follow a prior distribution. Similar to the earlier case, if you sample parameters from the prior, evaluate the likelihood using them, and take the mean of the likelihood, you should be able to approximate the marginal likelihood: $$\begin{align}\int p(\mathbf{y}|\theta, M) p(\theta | M)d\theta &= \mathbb{E}_{p(\theta|M)} [p(\mathbf{y}|\theta, M)] \\
+&\approx \frac{1}{S}p(\mathbf{y}|\tilde{\theta}_i, M),\quad \tilde{\theta}_i \sim p(\theta | M), \, i=1,\cdots, S.\end{align}$$ In theory, this approach should work well. In practice, you will encounter many problems.
+
+Bridge sampling is one of the methods for approximating the Bayes factor and the marginal likelihood. Earlier Monte Carlo methods for approximating the marginal likelihood had several issues harming estimation efficiency and numerical stability.
+
+-   If you choose Monte Carlo samples directly from your prior, depending on how disperse your prior is and how concentrated your posterior is, most of the Monte Carlo samples do not contribute to the final output because the likelihood becomes (near-)zero.
+
+-   A technique called *importance sampling* tries to alleviate this problem by drawing samples from a distribution that is similar to the posterior and easier to sample from (often called an *proposal distribution*), expecting a less number of "unhelpful" samples. However, we need 'calibration'[^1] because we are not sampling directly from the prior. Depending on the shape of the proposal distribution, the result of 'calibration' can be numerically unstable.
+
+[^1]: Please note that the term 'calibration' is not a formal word used in this context. Formally saying, we compute the so-called *importance ratio* that is multiplied to samples from the proposal distribution.
+
+Bridge sampling provided one way to solve these problems with a new concept ("bridge function") and computational tricks (iteratively estimating and improving the marginal likelihood estimate). If you are interested in the underlying mathematics and computations, [a tutorial paper by Gronau and colleagues (2017)](https://www.sciencedirect.com/science/article/pii/S0022249617300640) is a good read to check.
+
+### Side notes & materials
+
+Unfortunately, pystan does not have an implementation of the bridge sampling algorithm. You can find a replication of Gronau et al. (2017) using Python and PyMC3 below.
+
+-   [Marginal likelihood in Python and PyMC3](https://gist.github.com/junpenglao/4d2669d69ddfe1d788318264cdcf0583)
+
+## Posterior predictive model assessment
+
+### WAIC
+
+**W**idely **A**pplicable **I**nformation **C**riterion (WAIC; a.k.a. **W**atanabe-**A**kaike **I**nformation **C**riterion) is one of the information criteria for comparing models based on the model fit penalized by model complexity, similar to AIC and BIC.[^2]
+
+[^2]: Classically, in a Bayesian context, another information criterion named Deviance Information Criterion (DIC) has been frequently used. However, DIC did not exploit what Bayesian inference has to offer because it only relied only on the **mean estimate** from the posterior distribution, not using the full posterior.
+
+WAIC is defined using the log point-wise predictive density (lppd) approximated by all valid posterior samples:
+
+$$\text{lppd}(\mathbf{y}, \hat{\Theta}) := \sum_{i=1}^{N} \log \frac{1}{S}\sum_{s=1}^S p(y_i | \hat{\theta}_s) = \sum_{i=1}^N \bigg\{\log\sum_{s=1}^S p(y_i | \hat{\theta}_s) - \log S\bigg\},\\\text{D}(\mathbf{y},\hat{\Theta}) = -2\text{lppd}(\mathbf{y, \hat{\Theta}})$$ where $\mathbf{y}$ is the observed data consisting of $N$ points, $\hat{\Theta}$ is a set of $S$ samples approximating the posterior distribution. Given the lppd, WAIC can be computed as follows:
+
+$$WAIC = -2\big\{ \text{lppd}(\mathbf{y}, \hat{\Theta}) - \underbrace{\sum_{i=1}^N \text{Var}_{\hat{\Theta}} \log p(y_i | \hat{\theta})}_{\text{penalty (a.k.a. the effective number of parameters)}} \big\}$$
+
+### PSIS
+
+-   [Vehtari, Gelman, & Gabry (2017)](https://link.springer.com/article/10.1007/s11222-016-9696-4)
+
+Cross-validation is often used for approximating out-of-sample predictive accuracy using samples we have. Your dataset is first separated into $K$ subsets (ideally, of equal size). You fit the model $K$ times, each time excluding data points in the $k$-th subset from your data ($k = 1, \cdots, K$). Given the fitted model with each reduced dataset, you can predict the output of the $k$-th subset and evaluate predictive accuracy (in terms of prediction error or predictive likelihood).
+
+In leave-one-out cross-validation (LOOCV), the size of each subset to be excluded is exactly one data point. If your dataset consists of $N$ data points, you fit the model $N$ times, excluding a single data point each time. A major problem of LOOCV is that it becomes computationally expensive as $N$ increases. Numerical approximation methods for LOOCV have been proposed, and PSIS (Pareto-smoothing importance sampling) is one of them.
+
+In the context of LOOCV, the quantity we want to evaluate is **the probability that you observe** $y_i$ **from the model fitted without** $y_i$: $$p(y_i | \mathbf{y}_{-i}) = \int p(y_i | \theta) p(\theta | \mathbf{y}_{-i}) d\theta = \mathbb{E}_{p(\theta|\mathbf{y}_{-i})} \big[p(y_i | \theta)\big]$$ where
+
+-   $p(\theta | \mathbf{y}_{-i})$: the posterior density of $\theta$ when the model was fitted without a 'held-out sample' $y_i$; and
+
+-   $p(y_i | \theta)$: the predictive density of $y_i$ given the parameter $\theta$.
+
+The quantity above can be approximated by sampling $\theta$ from $p(\cdot | \mathbf{y}_{-i})$, but the problem is that we don't know this distribution. What we know is $p(\cdot | \mathbf{y})$, the posterior distribution of parameters with a complete dataset $\mathbf{y}$. As discussed in the Bayes factor section, an *importance sampling* method can be used to replace $p(\cdot | \mathbf{y}_{-i})$ with $p(\cdot | \mathbf{y})$ with appropriate 'calibration'. The result shows that the log predictive density of each held-out sample $y_i$ can be approximated using the log point-wise predictive density: $$p(y_i | \mathbf{y}_{-i}) \approx \Bigg[\frac{1}{S} \sum_{s=1}^S \frac{1}{p(y_i | \hat{\theta}_s)}\Bigg]^{-1}, \\ \text{lppd}_{\text{LOOCV}}=\sum_{i=1}^{N}\log p(y_i | \mathbf{y}_{-i}).$$
+
+However, as discussed in the Bridge Sampling section, importance sampling requires 'calibration'. And the output of importance-sampling approximation can be numerically unstable according to the characteristics of this 'calibration' factor. PSIS stabilizes this 'calibration' factor by a smoothing procedure using [a generalized Pareto distribution](https://en.wikipedia.org/wiki/Generalized_Pareto_distribution) -- the so-called 'Pareto smoothing'.
+
+A significant advantage of PSIS is that you can evaluate the stability of LOOCV approximation. The Pareto smoothing procedure includes fitting a generalized Pareto distribution, and this distribution has a shape parameter $k$. The estimate of $k$, $\hat{k}$, provides information about the reliability of the PSIS estimate.
+
+# Comparing two means: Revisited
+
+```{r fig.height=5, fig.width=8}
+# Simulate a dataset
+set.seed(1)
+y1 = rnorm(100, 10, 0.5)
+y2 = rnorm(100, 15, 1)
+# y1 = rep(10, 100)
+# y2 = rep(15, 100)
+set.seed(NULL)
+
+y.range = range(c(y1, y2))
+
+# Plot!
+hist(y1, breaks = seq(y.range[1], y.range[2], length.out = 25), col = rgb(1,0,0,0.3),
+     xlim = c(8, 18), main = "Data", xlab = "Values")
+hist(y2, breaks = seq(y.range[1], y.range[2], length.out = 25), col = rgb(0,0,1,0.3), add = T)
+legend(inset = 0.01, "top", col = c(rgb(1,0,0,0.3), rgb(0,0,1,0.3)),
+       pch = 15, pt.cex = 2, c("Group 1", "Group 2"))
+```
+
+## Model fitting
+
+We will fit the homogeneous-variance and heterogeneous-variance models again. To make things easier for model comparison, we will compute the log pointwise predictive density (lppd) at this stage. We will use the `generated quantities` block to define this variable.
+
+No matter how your data are separated into multiple vectors or matrices, it is strongly recommended to store the lppd for all data points in one variable (see the example below). I used `log_lik` as a variable name because it is used as a default option in R packages for model comparison.
+
+### Model 1: Two groups have the same variance
+
+```{r}
+m1.statement = "
+data {
+  int n;
+  real y1[n]; // y1 is a real-numbered vector of length n.
+  real y2[n]; // y2 is a real-numbered vector of length n.
+}
+
+parameters {
+  vector[2] mu;
+  real sigma;
+}
+
+model {
+  for (i in 1:n){
+    y1[i] ~ normal(mu[1], sigma);
+    y2[i] ~ normal(mu[2], sigma);
+  }
+  for (j in 1:2){
+    mu[j] ~ normal(0, 10);
+  }
+  sigma ~ exponential(1);
+}
+
+generated quantities {
+  // Declare a variable storing log pointwise predictive density.
+  // The first n elements will be for Group 1 (corresponding to y1),
+  // and the second n elements for Group 2 (corresponding to y2).
+  vector[2*n] log_lik; 
+  
+  // The following lines evaluate the probability 
+  // that each data point is observed given the posterior samples of mu and sigma.
+  for (i in 1:n){
+    log_lik[i] = normal_lpdf(y1[i] | mu[1], sigma);
+    log_lik[i+n] = normal_lpdf(y2[i] | mu[2], sigma);
+  }
+}
+"
+
+model1 = stan_model(model_code = m1.statement)
+fit1 = sampling(model1, 
+                data = list(n = length(y1), y1 = y1, y2 = y2), 
+                iter = 2000,
+                chains = 4, cores = 4)
+
+```
+
+### Model 2: Two groups have different variance
+
+```{r}
+m2.statement = "
+data {
+  int n;
+  real y1[n]; // y1 is a real-numbered vector of length n.
+  real y2[n]; // y2 is a real-numbered vector of length n.
+}
+
+parameters {
+  vector[2] mu;
+  vector[2] sigma;
+}
+
+model {
+  for (i in 1:n){
+    y1[i] ~ normal(mu[1], sigma[1]);
+    y2[i] ~ normal(mu[2], sigma[2]);
+  }
+  for (j in 1:2){
+    mu[j] ~ normal(0, 10);
+  }
+  sigma ~ exponential(1);
+}
+
+generated quantities {
+  vector[2*n] log_lik;
+  for (i in 1:n){
+    log_lik[i] = normal_lpdf(y1[i] | mu[1], sigma[1]);
+    log_lik[i+n] = normal_lpdf(y2[i] | mu[2], sigma[2]);
+  }
+}
+"
+
+model2 = stan_model(model_code = m2.statement)
+fit2 = sampling(model2, 
+                data = list(n = length(y1), y1 = y1, y2 = y2), 
+                iter = 2000,
+                chains = 4, cores = 4)
+
+```
+
+## Model comparison
+
+### PSIS cross-validation
+
+A function `loo` from the R package `loo` computes the predictive performance using the log point-wise predictive density (i.e., `log_lik`) in the model.
+
+```{r}
+loo1 = loo(fit1, pars = "log_lik")
+loo2 = loo(fit2, pars = "log_lik")
+
+print(loo1)
+print(loo2)
+```
+
+The function `loo` returns three components: `elpd_loo` (expected log point-wise predictive density), `p_loo` ('the effective number of parameters'), `looic` (LOOCV information criterion). `looic` is our target measure to compare and defined as $-2 \times (\text{elpd_loo})$. Columns are the mean estimate (left) and its standard error (right).
+
+The output also reports the $k$ estimates from the fitted generalized Pareto distribution. Roughly saying, $k>0.5$ makes the resulting PSIS estimate less trustworthy due to potential problems in the smooting procedure. In practice, $k<0.7$ seems to work well.
+
+```{r}
+print(loo_compare(loo1, loo2), simplify = FALSE, digits = 3)
+```
+
+`loo_compare` compares the PSIS-related measures in a single table. Models are ordered in descending order of `elpd_loo`, and equivalently, increasing order of `looic`. `simplify = TRUE` only shows the difference in `elpd` and its standard error. `digits` determine the number of digits to be shown.
+
+#### Computing PSIS from scratch
+
+You can evaluate the PSIS measure by yourself, although the procedure is somewhat complicated. I will discuss the implementation of PSIS based on [Vehtari, Gelman, & Gabry, (2017)](https://link.springer.com/article/10.1007/s11222-016-9696-4) in a separate note.
+
+### WAIC
+
+We can compute WAIC directly from the posterior samples. This is way easier than PSIS from scratch.
+
+We can again use the log pointwise predictive densities (lppd) of the data, without the need to compute it again.
+
+```{r}
+post1 = extract(fit1)
+post2 = extract(fit2)
+
+lppd1 = apply(post1$log_lik, 2, function(x) log(sum(exp(x))) - log(length(x)))
+pWAIC1 = apply(post1$log_lik, 2, function(x) var(x))
+
+lppd2 = apply(post1$log_lik, 2, function(x) log(sum(exp(x))) - log(length(x)))
+pWAIC2 = apply(post1$log_lik, 2, function(x) var(x))
+
+waic1.manual = -2 * (sum(lppd1) - sum(pWAIC1))
+waic2.manual = -2 * (sum(lppd2) - sum(pWAIC2))
+
+waic1.se = sqrt(ncol(post1$log_lik) * var(-2 * (lppd1 - pWAIC1)))
+waic2.se = sqrt(ncol(post2$log_lik) * var(-2 * (lppd2 - pWAIC2)))
+```
+
+-   Extract posterior samples first using `extract(stanfit_object)`. You can call posterior samples for `log_lik` by `(returned_object_from_extract)$log_lik` (`log_lik` from here for simplicity). The output is a $S \times N$ matrix whose column corresponds to an individual data point.
+-   First, you can compute the point-wise lppd, `lppd`, by `apply(log_lik, 2, function(x) log(sum(exp(x))) - log(length(x))`.
+    -   `apply(X, MARGIN, FUN)` applies a function `FUN` to margins `MARGIN` of an array or matrix `X`. `MARGIN`=1 and `MARGIN`=2 apply the function to every row and column, respectively.
+    -   `function(x) log(sum(exp(x))) - log(length(x))` is an one-line declaration of the function for computing the lppd.
+        -   The first term `log(sum(exp(x)))` computes $\log\sum_{s=1}^S p(y_i | \hat{\theta}_s)$: Given the lppd vector `x`, it is first exponentiated then summed and log-transformed again.
+        -   The second term `log(length(x))` returns $\log S$ where $S$ is the number of posterior samples.
+-   The penalty term (or, 'the effective number of samples'), `pWAIC`, is computed by `apply(log_lik, 2, function(x) var(x))`. For each column representing an individual data point, variance of the lppd is returned.
+-   WAIC is the sum of point-wise lppd minus the sum of the point-wise penalty term, multiplied by -2. The command `-2 * (sum(lppd) - sum(pWAIC))` will return the total WAIC.
+    -   The standard error of WAIC is the standard deviation of the point-wise WAIC divided by the square root of the number of data points.
+
+The R package `loo` has a function `waic` that returns the WAIC value from the lppd. `waic` needs the `log_lik` variable.
+
+```{r}
+# waic1 = waic(extract_log_lik(fit1, parameter_name = "log_lik"))
+# waic2 = waic(extract_log_lik(fit2, parameter_name = "log_lik"))
+waic1 = waic(extract(fit1)$log_lik)
+waic2 = waic(extract(fit2)$log_lik)
+
+print(waic1)
+print(waic2)
+```
+
+### Marginal likelihood
+
+The R package `bridgesampling` has functions for evaluating marginal likelihood for individual models and computing the Bayes factor comparing two models.
+
+-   `bridge_sampler(stanfit_object)`: Computes the approximate marginal likelihood.
+-   `bayes_factor(marginal_likelihood_from_m1, marginal_likelihood_from_m2)`: Computes the Bayes factor supporting `m1` over `m2`
+
+```{r}
+ml1 = bridge_sampler(fit1)
+ml2 = bridge_sampler(fit2)
+
+#bayes_factor(ml2, ml1)
+
+print(ml2)
+```

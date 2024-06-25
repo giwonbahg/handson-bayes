@@ -1,0 +1,358 @@
+---
+title: "Bayes Workshop Week 2a"
+output: html_notebook
+---
+
+```{r}
+library("rstan")
+library("loo")
+library("bridgesampling")
+```
+
+# Pareto-smoothing importance sampling leave-one-out cross-validation (PSIS)
+
+In this side note, we will implement PSIS, an approximation of leave-one-out cross-validation using posterior samples. I will follow the procedure of [Vehtari, Gelman, & Gabry (2017)](https://link.springer.com/article/10.1007/s11222-016-9696-4) (also see McElreath, 2020).
+
+## Model fitting
+
+Let's first fit the two mean-comparison models. For convenience, make sure to evaluate the log point-wise predictive density in the `generated quantities` block.
+
+```{r fig.height=5, fig.width=8}
+# Simulate a dataset
+set.seed(1)
+y1 = rnorm(100, 10, 0.5)
+y2 = rnorm(100, 15, 1)
+set.seed(NULL)
+
+y.range = range(c(y1, y2))
+
+# Plot!
+hist(y1, breaks = seq(y.range[1], y.range[2], length.out = 25), col = rgb(1,0,0,0.3),
+     xlim = c(8, 18), main = "Data", xlab = "Values")
+hist(y2, breaks = seq(y.range[1], y.range[2], length.out = 25), col = rgb(0,0,1,0.3), add = T)
+legend(inset = 0.01, "top", col = c(rgb(1,0,0,0.3), rgb(0,0,1,0.3)),
+       pch = 15, pt.cex = 2, c("Group 1", "Group 2"))
+```
+
+```{r}
+m1.statement = "
+data {
+  int n;
+  real y1[n]; // y1 is a real-numbered vector of length n.
+  real y2[n]; // y2 is a real-numbered vector of length n.
+}
+
+parameters {
+  vector[2] mu;
+  real sigma;
+}
+
+model {
+  for (i in 1:n){
+    y1[i] ~ normal(mu[1], sigma);
+    y2[i] ~ normal(mu[2], sigma);
+  }
+  for (j in 1:2){
+    mu[j] ~ normal(0, 10);
+  }
+  sigma ~ exponential(1);
+}
+
+generated quantities {
+  // Declare a variable storing log pointwise predictive density.
+  // The first n elements will be for Group 1 (corresponding to y1),
+  // and the second n elements for Group 2 (corresponding to y2).
+  vector[2*n] log_lik; 
+  
+  // The following lines evaluate the probability 
+  // that each data point is observed given the posterior samples of mu and sigma.
+  for (i in 1:n){
+    log_lik[i] = normal_lpdf(y1[i] | mu[1], sigma);
+    log_lik[i+n] = normal_lpdf(y2[i] | mu[2], sigma);
+  }
+}
+"
+
+model1 = stan_model(model_code = m1.statement)
+fit1 = sampling(model1, 
+                data = list(n = length(y1), y1 = y1, y2 = y2), 
+                iter = 2000,
+                chains = 4, cores = 4)
+
+```
+
+```{r}
+m2.statement = "
+data {
+  int n;
+  real y1[n]; // y1 is a real-numbered vector of length n.
+  real y2[n]; // y2 is a real-numbered vector of length n.
+}
+
+parameters {
+  vector[2] mu;
+  vector[2] sigma;
+}
+
+model {
+  for (i in 1:n){
+    y1[i] ~ normal(mu[1], sigma[1]);
+    y2[i] ~ normal(mu[2], sigma[2]);
+  }
+  for (j in 1:2){
+    mu[j] ~ normal(0, 10);
+  }
+  sigma ~ exponential(1);
+}
+
+generated quantities {
+  vector[2*n] log_lik;
+  for (i in 1:n){
+    log_lik[i] = normal_lpdf(y1[i] | mu[1], sigma[1]);
+    log_lik[i+n] = normal_lpdf(y2[i] | mu[2], sigma[2]);
+  }
+}
+"
+
+model2 = stan_model(model_code = m2.statement)
+fit2 = sampling(model2, 
+                data = list(n = length(y1), y1 = y1, y2 = y2), 
+                iter = 2000,
+                chains = 4, cores = 4)
+
+```
+
+## Importance sampling
+
+As discussed in the main note, we want to evaluate the expected predictive density (epd) for the $i$-th data point, $y_i$, using the posterior obtained from the dataset without the 'held-out sample', $\mathbf{y}_{-i} = \{y_1, y_2, \cdots, y_{i-1}, y_{i+1}, \cdots, y_N\}$. $$\text{epd}_i = \int_{\theta\in\Theta}p(y_i | \theta) p(\theta | \mathbf{y}_{-i}) d\theta$$ However, this is very costly when the number of data points $N$ is large.
+
+The importance sampling method suggests an alternative approach using a so-called 'proposal distribution' $g$ that can replace the target distribution $p(\cdot | \mathbf{y}_{-i})$ that we cannot get: $$\begin{align}\text{epd}_i &= \int_{\theta\in\Theta}p(y_i | \theta) p(\theta | \mathbf{y}_{-i}) d\theta \\ 
+&=\int_{\theta\in\Theta}p(y_i | \theta) \frac{p(\theta | \mathbf{y}_{-i})}{g(\theta)} g(\theta) d\theta .\end{align}$$ Going even further, $$\begin{align}\text{epd}_i &= \frac{\int_{\theta\in\Theta}p(y_i | \theta) p(\theta | \mathbf{y}_{-i}) d\theta}{\int_{\theta\in\Theta} p(\theta | \mathbf{y}_{-i}) d\theta} \qquad \Bigg(\because \int_{\theta\in\Theta} p(\theta | \mathbf{y}_{-i}) d\theta = 1\Bigg)\\ 
+&=\frac{\int_{\theta\in\Theta}p(y_i | \theta) \frac{p(\theta | \mathbf{y}_{-i})}{g(\theta)} g(\theta) d\theta}{\int_{\theta\in\Theta} \frac{p(\theta | \mathbf{y}_{-i})}{g(\theta)}g(\theta) d\theta} .\end{align}$$
+
+The most convenient option for $g$ is the posterior obtained from the complete dataset, $p(\theta | \mathbf{y})$: $$\begin{align}\text{epd}_i &=\frac{\int_{\theta\in\Theta}p(y_i | \theta) \frac{p(\theta | \mathbf{y}_{-i})}{p(\theta | \mathbf{y})} p(\theta | \mathbf{y}) d\theta}{\int_{\theta\in\Theta} \frac{p(\theta | \mathbf{y}_{-i})}{p(\theta | \mathbf{y})}p(\theta | \mathbf{y}) d\theta} .\end{align}$$ The ratio $p(\theta | \mathbf{y}_{-i})/p(\theta | \mathbf{y})$ is called an **importance ratio** and plays a crucial role in importance sampling. The 'calibration' we need by using an alternative proposal distribution is done by this importance ration.
+
+The problem is that we don't know $p(\theta | \mathbf{y}_{-i})$, but we can still compute this ratio somehow. See below: $$\begin{align}p(\theta | \mathbf{y}) &\propto p(\theta) p(\mathbf{y}|\theta) = p(\theta)\prod_j p(y_j | \theta),\\
+p(\theta | \mathbf{y}_{-i}) &\propto p(\theta) p(\mathbf{y}_{-i}|\theta) = p(\theta)\prod_{j \neq i} p(y_j | \theta),\\
+\frac{p(\theta | \mathbf{y}_{-i})}{p(\theta | \mathbf{y})} &\propto \frac{p(\theta)\prod_{j \neq i} p(y_j | \theta)}{p(\theta)\prod_j p(y_j | \theta)} = \frac{1}{p(y_i | \theta)}.\end{align}$$ The importance ratio we want is the inverse of the posterior predictive density for the held-out sample $y_i$ estimated from the complete dataset.
+
+Therefore, $$\begin{align}\text{epd}_i &=\frac{\int_{\theta\in\Theta}p(y_i | \theta) \frac{p(\theta | \mathbf{y}_{-i})}{p(\theta | \mathbf{y})} p(\theta | \mathbf{y}) d\theta}{\int_{\theta\in\Theta} \frac{p(\theta | \mathbf{y}_{-i})}{p(\theta | \mathbf{y})}p(\theta | \mathbf{y}) d\theta} \\
+&=\frac{\int_{\theta\in\Theta}p(y_i | \theta) \frac{1}{p(y_i | \theta)} p(\theta | \mathbf{y}) d\theta}{\int_{\theta\in\Theta} \frac{1}{p(y_i | \theta)}p(\theta | \mathbf{y}) d\theta} \\
+&= \frac{\int_{\theta\in\Theta}p(\theta | \mathbf{y}) d\theta}{\int_{\theta\in\Theta} \frac{1}{p(y_i | \theta)}p(\theta | \mathbf{y}) d\theta} \\
+&= \frac{1}{\int_{\theta\in\Theta} \frac{1}{p(y_i | \theta)}p(\theta | \mathbf{y}) d\theta}.\end{align}$$
+
+Now, we need to evaluate the integral in the denominator. We can approximate this by Monte Carlo integration: $$\int_{\theta\in\Theta} \frac{1}{p(y_i | \theta)}p(\theta | \mathbf{y}) d\theta \approx \frac{1}{S}\sum_{s=1}^S \frac{1}{p(y_i | \hat{\theta}_s)} \quad \text{where }\hat{\theta}_s \sim p(\theta | \mathbf{y})$$ where $S$ is the number of posterior samples. As we have posterior samples $\hat{\theta}_s$, if we evaluate the point-wise predictive density $p(y_i | \theta)$ using $\theta = \hat{\theta}_s$, simply averaging $p(y_i | \hat{\theta}_s)$ gives us the approximation of the integral.
+
+## Pareto smoothing
+
+It turned out that we can just average the importance ratio (i.e., the inverse of the point-wise predictive density). However, some posterir samples may produce the predictive density that is extremely low, making its inverse explosively large. This may harm the reliability of the epd estimate.
+
+Vehtari et al. (2017) suggests a smoothing procedure using a generalized Pareto distribution with pdf $$f_{gP}(x | \mu, \sigma, k) = \frac{1}{\sigma} \bigg[1 + k \big(\frac{x - \mu}{\sigma}\big)\bigg]^{-\frac{1}{k}-1}.$$
+
+1.  Given the held-out sample $y_i$, fit the generalized Pareto distribution to the top 20% largest importance ratio, denoted $\{r_{i,1}^*, r_{i,2}^*, \cdots, r_{i,M}^*\}$. $M$ is the total number of the chosen largest importance ratio (i.e., $M = 0.2 S$). You will get an estimate of the location parameter $\hat{\mu}$, the scale parameter $\hat{\sigma}$, and the shape parameter $\hat{k}$.
+2.  Using the estimates $(\hat{\mu}, \hat{\sigma}, \hat{k})$, stabilize the $M$ largest importance ratio by $$\tilde{w}_{i,s} = F_{gP}^{-1} \bigg(\frac{\text{rank}(r_{i,s}^*) - 0.5}{M}\bigg | \hat{\mu}, \hat{\sigma}, \hat{k} \bigg)$$ where $$F_{gP}^{-1}(p |  \mu, \sigma, k) = \mu + \frac{\sigma}{k} \bigg\{\bigg(\frac{1}{1-p}\bigg)^{k} -1\bigg\}$$ is an inverse function of the generalized Pareto CDF, and $\text{rank}(x)$ returns the rank of $x$ in a set of consideration.
+3.  If $r_{i,s}$ was smoothed, replace it with $\tilde{w}_{i,s}$. Let's denote the updated importance ratio vector $\tilde{\mathbf{r}}_{i}$.
+4.  To make sure that the final estimate has finite variance, truncate $\tilde{\mathbf{r}}_i$ at $S^{3/4} \frac{1}{M} \sum_{j=1}^M\tilde{w}_{i,j}$. Let's denote the truncated importance ratio $w_{i,s}$.
+
+Then, for the held-out sample $y_i$, its approximate expected predictive density is $$\text{epd}_i = \frac{\sum_{s=1}^S w_{i,s} p(y_i | \hat{\theta}_s)}{\sum_{s=1}^S w_{i,s}}.$$ Our target measure, the expected log point-wise predictive density is $$\text{elpd}_{\text{PSIS}} = \sum_{i=1}^{N} \log (\text{epd}_i) = \sum_{i=1}^N \log \Bigg\{\frac{\sum_{s=1}^S w_{i,s} p(y_i | \hat{\theta}_s)}{\sum_{s=1}^S w_{i,s}}\Bigg\}.$$
+
+# Line-by-line implementation
+
+First, we need a few custom functions.
+
+```{r}
+# Custom functions required for fitting the generalized Pareto distribution
+
+# 1. softplus for estimating sigma.
+softplus = function(x, beta = 10){
+  log(1+exp(beta * x)) / beta
+}
+
+# 2. log density of the generaliezd Pareto distribution
+log.dens.gpd = function(prmts, dat){
+  # We will explore the parameter space in an real-number space.
+  
+  # The location parameter 'mu' and the shape parameter 'k' are defined on
+  # an unconstrained real number space, i.e., mu and k can be any real numbers.
+  # However, the scale parameter 'sigma' must be positive,
+  # so we apply softplus transformation (a smooth & continuous version of ReLU).
+  mu = prmts[1]
+  sigma = softplus(prmts[2]) # transform to make it positive
+  k = prmts[3]
+  
+  z = (dat - mu) / sigma
+  
+  dens = (1/sigma) * (1 + k * z)^(-1/k -1)
+  sum(log(dens))
+}
+
+# 3. Inverse CDF of the generaliezd Pareto distribution
+inv.cdf.gpd = function(p, prmts.optim){
+  # The estimated best parameters are found in a real-number space,
+  # as we set in the log density function above.
+  # You can use the best estimate from the optimizer function
+  # without additional transformation.
+  mu = prmts.optim[1]
+  sigma = softplus(prmts.optim[2]) # make it positive
+  k = prmts.optim[3]
+  
+  mu + sigma/k * ((1/(1-p))^k - 1)
+}
+```
+
+Let's extract the log point-wise predictive density values, stored in the `log_lik` variable.
+
+```{r}
+loglik1 = extract(fit1)$log_lik
+loglik2 = extract(fit2)$log_lik
+
+# Importance ratio = 1/exp(log_lik)
+IR1 = 1/exp(loglik1)
+IR2 = 1/exp(loglik2)
+
+# Identify the top 20% largest importance ratios
+idx.extreme.IR1 = which(IR1 > quantile(IR1, probs = 0.8), arr.ind = T)
+idx.extreme.IR2 = which(IR2 > quantile(IR2, probs = 0.8), arr.ind = T)
+
+extreme.IR1 = IR1[idx.extreme.IR1]
+extreme.IR2 = IR1[idx.extreme.IR2]
+```
+
+Fit the generalized Pareto distribution to extreme importance ratio values. We will simply optimize (`optim`) the log density function (`log.dens.gpd`) to find the parameters that maximize the likelihood.
+
+```{r}
+gpd.optim1 = optim(runif(3, 0, 1), log.dens.gpd, dat = extreme.IR1,
+                   control = list(maxit = 10000, fnscale = -1))
+gpd.optim2 = optim(runif(3, 0, 1), log.dens.gpd, dat = extreme.IR2,
+                   control = list(maxit = 10000, fnscale = -1))
+```
+
+-   `optim` is R's default optimizer function. By default, `optim` finds a parameter that minimizes the output of a target function (`log.dens.gpd`).
+
+-   `control = list(...)` is an argument for controlling the optimizer's behavior.
+
+    -   `fnscale`: The function `optim` is by default a minimizer, but we want to find the parameter maximizing the log density (i.e., `log.dens.gpd`). By setting `fnscale` as any negative value, you can make `optim` work as a maximizer.
+
+Stabilize the extreme importance ratio values. The inverse CDF function (`inv.cdf.gpd`) was defined to use the estimate from the optimizer (`optim`) directly. You can retrieve the estimated best parameter by calling `(optim_output)$par`.
+
+-   Note that, in this example code, the scale parameter (`(optim_output)$par[2])`) was used as a log-transformed value.
+
+    -   I made the inverse CDF function `inv.cdf.gpd` so that it can be used without additional parameter transformation from the `optim`'s output. You can just put `(optim_output)$par`.
+
+    -   However, if you want to see and use the shape paramter estimate in any other functions/environments, you need to exponentiate it, i.e., `exp((optim_output)$par[2])`.
+
+```{r}
+# Stabilize the extreme importance ratios
+stabilized.IR1 = inv.cdf.gpd((rank(extreme.IR1) - 0.5)/length(extreme.IR1), gpd.optim1$par)
+stabilized.IR2 = inv.cdf.gpd((rank(extreme.IR2) - 0.5)/length(extreme.IR2), gpd.optim2$par)
+
+# Replace the extreme importance ratios with the smoothed values
+IR1.new = IR1; IR1.new[idx.extreme.IR1] = stabilized.IR1
+IR2.new = IR2; IR2.new[idx.extreme.IR2] = stabilized.IR2
+```
+
+Truncate the updated importance ratio:
+
+```{r}
+for (i in 1:ncol(IR1.new)){
+  temp.ub = length(IR1.new[,i])^(3/4) * mean(IR1.new[,i])
+  IR1.new[,i] = unlist(sapply(IR1.new[,i], function(x) ifelse(x > temp.ub, temp.ub, x)))
+}
+
+for (i in 1:ncol(IR2.new)){
+  temp.ub = length(IR2.new[,i])^(3/4) * mean(IR2.new[,i])
+  IR2.new[,i] = unlist(sapply(IR2.new[,i], function(x) ifelse(x > temp.ub, temp.ub, x)))
+}
+```
+
+Our target measure, the expected log predictive density, can be computed as follows:
+
+```{r}
+# The elpd estimate
+elpd1 = sum(log(colSums(IR1.new * exp(loglik1)) / colSums(IR1.new)))
+elpd2 = sum(log(colSums(IR2.new * exp(loglik2)) / colSums(IR2.new)))
+
+# The standard error of the elpd estimate
+elpd1.se = sqrt(ncol(post1$log_lik) * var(log(colSums(IR1.new * exp(loglik1)) / colSums(IR1.new))))
+elpd2.se = sqrt(ncol(post2$log_lik) * var(log(colSums(IR2.new * exp(loglik2)) / colSums(IR2.new))))
+```
+
+Let's compare our implementation with the output from `loo`:
+
+```{r}
+loo1 = loo(fit1)
+loo2 = loo(fit2)
+
+# Compare
+plot(1:2-0.05, c(loo1$estimates[1,1], loo2$estimates[1,1]), pch = 16, cex = 2, col = "red", 
+     xlim = c(0.5, 2.5), ylim = c(-260, -175),
+     xaxt="n", xlab = "", ylab = "Log density", 
+     main = "Expected log predictive density")
+lines(c(1,1)-0.05, 
+      c(loo1$estimates[1,1] - loo1$estimates[1,2], loo1$estimates[1,1] + loo1$estimates[1,2]),
+      col = "red")
+lines(c(2,2)-0.05, 
+      c(loo2$estimates[1,1] - loo2$estimates[1,2], loo2$estimates[1,1] + loo2$estimates[1,2]),
+      col = "red")
+axis(1, at = 1:2, c("Model 1", "Model 2"))
+
+points(1:2 + 0.05, c(elpd1, elpd2), pch = 15, cex = 2, col = "blue")
+lines(c(1,1)+0.05, 
+      c(elpd1 - elpd1.se, elpd1 + elpd1.se),
+      col = "blue")
+lines(c(2,2)+0.05, 
+      c(elpd2 - elpd2.se, elpd2 + elpd2.se),
+      col = "blue")
+
+legend(inset = 0.01, "bottomright", 
+       pch = c(16, 15), lwd = 1, lty = 1, col = c("red", "blue"),
+       c("R package 'loo' (+ 1SE)", "from scratch (+ 1SE)"))
+```
+
+# Self-contained function
+
+The PSIS procedure implemented in this note is unstable because I handled the step of fitting a Pareto distribution naively. (This function is also very slow!) Please just use `loo`.
+
+```{r}
+psis.looci = function(stanfit_object, par = "log_lik"){
+  # Compute the importance ratio
+  loglik = extract(stanfit_object)[[par]]
+  IR = 1/exp(loglik)
+  
+  # Identify the extreme IRs.
+  idx.extreme.IR = which(IR > quantile(IR, probs = 0.8), arr.ind = T)
+  extreme.IR = IR[idx.extreme.IR]
+  
+  # Fit the generalized Pareto distribution to the extreme IRs.
+  gpd.optim = optim(runif(3, -0.5, 0.5), log.dens.gpd, dat = extreme.IR,
+                    control = list(maxit = 10000, fnscale = -1))
+  
+  # Stabilize and update IRs.
+  stabilized.IR = inv.cdf.gpd((rank(extreme.IR) - 0.5)/length(extreme.IR), gpd.optim$par)
+  IR.new = IR
+  IR.new[idx.extreme.IR] = stabilized.IR
+  
+  # Truncate the updated IRs.
+  temp.ub = sapply(1:ncol(IR.new), function(i) IR.new[,i]^(3/4) * mean(IR.new[,i]))
+  for (i in 1:ncol(IR.new)){
+    IR.new[,i] = unlist(sapply(IR.new[,i], function(x) ifelse(x > temp.ub[i], temp.ub[i], x)))
+  }
+  
+  # Output
+  elpd = sum(log(colSums(IR.new * exp(loglik)) / colSums(IR.new)))
+  elpd.se = sqrt(ncol(loglik) * var(log(colSums(IR.new * exp(loglik)) / colSums(IR.new))))
+  looci = -2 * elpd
+  looci.se = 2 * elpd.se
+  
+  out = c(elpd, elpd.se, looci, looci.se, gpd.optim$par[3])
+  names(out) = c("elpd", "elpd_se", "looci", "looci_se", "pareto_k")
+  out
+}
+```
+
+```{r}
+psis1 = psis.looci(fit1)
+print(psis1)
+
+print(loo(fit1))
+```

@@ -1,0 +1,303 @@
+---
+title: "Bayes Workshop Week 1"
+output:
+  html_notebook: default
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+# Basic data and variable types in R
+
+In most cases, data types you will encounter in R are either `numeric` (i.e., numbers) or `string` (characters, strings consisting of characters).
+
+-   `vector`, `matrix`, and `array`: One-, two-, and higher-dimensional structure that can contain data of the same type.
+    -   If two vectors/matrices/arrays have the same size, addition/subtraction/multiplication/division operators will do element-wise operation.
+-   `data.frame`: An R equivalent of Python/pandas `DataFrame`.
+    -   Dataframes basically work like matrices. Unlike matrices, dataframes can contain varibles with various data types.
+    -   The only constraint is that all variable must contain the same number of instances.
+    -   You can access each variable (i.e., column) independently by calling `(dataframe_name)$(variable_name)`
+-   `list`: An R equivalent of Python `dictionary`.
+    -   Lists are similar to dataframes in that they can contain variables with multiple data types.
+    -   The length of each element can also vary.
+
+For Stan, `vector`, `matrix`, and `list` types will be most frequently used.
+
+```{r}
+# vector
+vector1 = c(1,2,3,4,5)
+vector2 = c(1,3,5,7,9)
+# print(vector1 * vector2)
+
+# data frame
+df = data.frame(group = c("A","B","A","A","B"),
+                sleep.time = c(4,7,5,4.5,6.5))
+# print(df)
+# print(df$group)
+
+# list
+list1 = list(idx.session = 1,
+             group = c("A","B","A","A","B"),
+             sleep.time = c(4,7,5,4.5,6.5),
+             caffeine.consumption = c(1,2))
+print(list1$idx.session)
+```
+
+# Stan
+
+We will start by installing and loading `rstan`, an R interface for Stan.
+
+```{r}
+# install.packages("rstan") # Install RStan, an R interface for Stan
+library("rstan")
+```
+
+# Example 1: Comparing the mean
+
+Let's start with a classic example: comparing the mean of two groups.
+
+```{r fig.height=5, fig.width=8}
+# Simulate a dataset
+set.seed(1)
+y1 = rnorm(100, 10, 0.5)
+y2 = rnorm(100, 15, 1)
+# y1 = rep(10, 100)
+# y2 = rep(15, 100)
+set.seed(NULL)
+
+y.range = range(c(y1, y2))
+
+# Plot!
+hist(y1, breaks = seq(y.range[1], y.range[2], length.out = 25), col = rgb(1,0,0,0.3),
+     xlim = c(8, 18), main = "Data", xlab = "Values")
+hist(y2, breaks = seq(y.range[1], y.range[2], length.out = 25), col = rgb(0,0,1,0.3), add = T)
+legend(inset = 0.01, "top", col = c(rgb(1,0,0,0.3), rgb(0,0,1,0.3)),
+       pch = 15, pt.cex = 2, c("Group 1", "Group 2"))
+```
+
+## Stan: Model statement
+
+Stan requires you to declare a model you want to fit. A simplest form of model statement consists of three blocks: `data`, `parameters`, and `model`.
+
+You can also add optional blocks like `transformed data`, `transformed parameters`, and `generated quantities`, depending on your setting. The `generated quantities` block is particularly important if you are interested in model comparison via (approximate) leave-one-out cross-validation. We will talk about optional blocks next time.
+
+```{r}
+m1.statement = "
+data {
+  int n;
+  real y1[n]; // y1 is a real-numbered vector of length n.
+  real y2[n]; // y2 is a real-numbered vector of length n.
+}
+
+parameters {
+  vector[2] mu;
+  real sigma;
+}
+
+model {
+  for (i in 1:n){
+    y1[i] ~ normal(mu[1], sigma);
+    y2[i] ~ normal(mu[2], sigma);
+  }
+  for (j in 1:2){
+    mu[j] ~ normal(0, 10);
+  }
+  sigma ~ exponential(1);
+}
+"
+```
+
+### `data` and `parameters`
+
+-   `data`: You declare placeholder variables for data. Variables in this block are fixed, and therefore, are not subject to sampling.
+-   `parameters`: You specify parameters of your interest. Variables in this block are what's going to be estimated.
+
+In both `data` and `parameters` blocks, you need to specify a data type of each variable.
+
+-   Scalars can be either `int` (integer), `real` (real numbers), or `complex` (complex numbers).
+-   You can set lower and upper bounds, e.g., `real<lower=0, upper=1> prob`.
+-   You can declare real-numbered vectors or matrices of arbitrary size with `vector` or `matrix`.
+    -   If you want to impose constraints on the range of values, e.g., `vector<lower=l, upper=u>[5] beta`.
+-   Some special data types may be useful, depending on your model:
+    -   $n$-dimensional **unit simplex** `simplex[n]`: A vector with non-negative values whose elements sum to 1
+    -   $n$-dimensional **unit vector** `unit_vector[n]`: A vector whose norm is 1
+    -   $n$-dimensional **ordered** (`ordered[n]`) and **positive ordered** (`positive_ordered[n]`) vectors
+    -   $D \times D$ **covariance** (`cov_matrix[D]`) and **correlation matrices** (`corr_matrix[D]`)[^1]
+
+[^1]: Mathematically, these types of matrices need to satisfy a condition: being *postiive semi-definite*. Data types like `cov_matrix` and `corr_matrix` are set to generate positive semi-definite matrices.
+
+### `model`
+
+In the `model` block, you at least need to declare a probabilistic model of data (i.e., likelihood), and ideally, prior distributions for model parameters as well.
+
+$$\overbrace{p(\theta | y)}^{\text{posterior}} \propto \underbrace{p(y | \theta)}_{\text{data model}} \overbrace{p(\theta)}^{\text{prior}} \equiv L(\theta|y) p(\theta)$$
+
+#### Likelihood (observation model)
+
+In the mean comparison case above, we assumed that
+
+-   Two separate Gaussian distributions describe data from two groups.
+-   These Gaussian distributions are characterized by different means but use a common variance term.
+
+Mathematically, you can write the model as $$y_{j,i} \sim N(\mu_j, \sigma) \quad (j=1\text{ or }2; \, i=1,\cdots,n),$$meaning that "$y_{j,i}$ is normally distributed with mean $\mu_j$ and standard deviation $\sigma$." An equivalent Stan model statement is
+
+```         
+for (i in 1:n){ // loop from 1 to n
+  y1[i] ~ normal(mu[1], sigma);
+  y2[i] ~ normal(mu[2], sigma);
+}
+```
+
+#### Prior
+
+We will also declare prior distributions for model parameters `mu[1]` ($\mu_1$), `mu[2]` ($\mu_2$), and `sigma` ($\sigma$). Let's assume that
+
+-   A group mean is normally distributed, e.g., $\mu_j \sim N(0,10)$.
+-   Standard deviation of the observation model is exponentially distributed, e.g., $\sigma \sim \text{Exp}(1)$.
+
+```         
+for (j in 1:2){
+  mu[j] ~ normal(0, 10); // mu is a two-dimensional vector!
+}
+sigma ~ exponential(1);
+```
+
+-   With appropriate data types, you can simplify the model statement using vector/matrix notations.
+-   If you do not specify a prior on your parameter, Stan will automatically apply an *unbounded* uniform prior (for example, $\mu_j \sim \text{Unif}(-\infty, \infty)$, $\sigma \sim \text{Unif}(0, \infty)$). This kind of distribution is called an **improper** prior because it does not integrate to 1.
+
+## Stan: Let's fit the model!
+
+We now have a statement of our model for group mean comparison. Let's fit the model.
+
+See the following code first:
+
+```{r}
+model1 = stan_model(model_code = m1.statement)
+fit1 = sampling(model1, 
+                data = list(n = length(y1), y1 = y1, y2 = y2), 
+                iter = 2000,
+                chains = 4, cores = 4)
+```
+
+-   `stan_model`: We transform the model statement in a simple text form into something that your computer can understand. As Stan works based on C++, this function translates the model statement to C++ code and compiles it.
+    -   If you declared a model statement code as *an R variable*, you need to call this variable by `stan_model(model_code = your_model_statement)`.
+    -   You can also save your model statement as *a separate text file* and call it by `stan_model(/your_working_directory/your_model_statement.stan)`.
+-   `sampling`: You call the compiled model and sample from the posterior.
+    -   `data`: You need to put your data as a list variable. The 'tag' of the list must be identical to the data variables in the model statement.
+    -   `iter`: The number of sampling steps.
+    -   `chains`: The number of independent *chains* sampling from the posterior.
+    -   `cores`: The number of cores you want to use (up to the number of `chains`). You can make multiple CPU cores work in parallel to obtain samples from multiple chains simultaneously.
+
+A function `stan` handles both model compilation and posterior sampling using a single function.
+
+```{r}
+fit1_stan = stan(model_code = m1.statement,
+                data = list(n = length(y1), y1 = y1, y2 = y2), iter = 2000, 
+                chains = 4, cores = 4)
+```
+
+## Stan: Let's see the result!
+
+A fitted model generates a summary table as shown below.
+
+```{r}
+fit1
+```
+
+The table shows
+
+-   posterior mean (`mean`),
+-   standard error of the posterior mean (`se_mean`)[^2],
+-   standard deviation of the posterior (`sd`),
+-   percentiles (`2.5%`, ..., `97.5%`),
+-   the number of effective samples (`n_eff`), and
+-   Gelman-Rubin convergence statistic $\hat{R}$ (`Rhat`).
+
+[^2]: Note that this is not what we call SEM (standard error of the mean) defined as standard deviation divided by the square root of sample size. SEM is about samples (i.e., data), but `se_mean` is about the posterior distribution of a parameter. According to [this](https://discourse.mc-stan.org/t/se-mean-in-print-stanfit/2869), `se_mean` is posterior standard deviation (`sd`) divided by the square root of effective posterior sample size (`n_eff`).
+
+For now, let's focus on the samples we obtained from the posterior distribution.
+
+```{r fig.height=6, fig.width=8}
+post.model1 = extract(fit1)
+
+# histogram
+par(mfrow = c(2,2))
+## mu[1]: Mean of the group 1
+hist(post.model1$mu[,1], main = "mu[1]", xlab = expression(mu[1]))
+abline(v = 10, col = 2, lwd = 3)
+abline(v = mean(post.model1$mu[,1]), col = 4, lwd = 3)
+legend("topleft", inset = 0.01, lty = 1, lwd = 3, col = c(2,4), cex = 0.8,
+       c("Ground truth", "Posterior mean"))
+
+## mu[2]: Mean of the group 2
+hist(post.model1$mu[,2], main = "mu[2]", xlab = expression(mu[2]))
+abline(v = 15, col = 2, lwd = 3)
+abline(v = mean(post.model1$mu[,2]), col = 4, lwd = 3)
+
+## sigma: shared standard deviation
+hist(post.model1$sigma, main = "sigma", xlab = expression(sigma))
+
+## mu[1] - mu[2]: Between-group mean difference
+hist(post.model1$mu[,1] - post.model1$mu[,2], main = "mu[1] − mu[2]", xlab = "Value")
+abline(v = 10-15, col = 2, lwd = 3)
+abline(v = mean(post.model1$mu[,1] - post.model1$mu[,2]), col = 4, lwd = 3)
+```
+
+You can also plot a joint distribtution of parameters pairwisely.
+
+```{r fig.height=6, fig.width=6}
+pairs(fit1, pars = c("mu[1]", "mu[2]", "sigma"), las = 1)
+```
+
+## Stan: Did it work well?
+
+When you see the histograms and joint posterior distribution plots, samples seems to have come from "something legit". However, we don't know yet whether the sampling procedure *worked well*. By 'worked well', we mean whether the chains have reached the correct posterior distribution.
+
+How good the samples from the posterior distribution are is usually not a binary question. There is no clear-cut standard to determine the quality of posterior samples. But you can use visual inspections and heuristics.
+
+### Traceplot: Visually inspecting the mixing quality
+
+A Markov chain needs to satisfy the following conditions to reach its equilibrium distribution:
+
+-   Irreducible: A chain should be able to move from any region to any other region.
+-   Aperiodic: A chain's behavior must not follow deterministic cycles.
+-   Positive recurrent: A chain must be able to return to any region within a finite expected time. In other words, a chain must not drift away forever.
+
+From these rules, you can imagine what the posterior chains should look like. Plotting a **traceplot** is one way to diagnose whether your chains have reached the stable posterior distribution and are sampling from it. Traditionally, a traceplot that looks like a "hairy caterpillar" is considered ideal.
+
+```{r}
+traceplot(fit1)
+
+# If you want to plot each variable separately:
+# traceplot(fit1, pars = c("mu[1]"))
+```
+
+### Gelman-Rubin convergence statistic
+
+We have initialized four chains (`chains = 4`). To conclude that we sampled from a posterior distribution, the chains need to reach the same region for sampling. In other words, the chains must be **converged**. In our between-group mean comparison case, the traceplot suggests that all the four chains arrived the same distribution. However, it may not be very straightforward to diagnose convergence by visually inspecting traceplots.
+
+[Gelman and Rubin (1992)](https://projecteuclid.org/journals/statistical-science/volume-7/issue-4/Inference-from-Iterative-Simulation-Using-Multiple-Sequences/10.1214/ss/1177011136.full) suggested a statistic for diagnosing the convergence of multiple chains, named $\hat{R}$. The definition of $\hat{R}$ has been revised a couple of times, but its underlying logic is basically similar to that of ANOVA, **comparing between-chain and within-chain variances**. If all chains converged on the same region, between-chain variance must not be greater than within-chain variances.
+
+Stan computes $\hat{R}$ after splitting each chain into two halves to evaluate whether chains achieved stationarity (i.e., whether chains arrived a stable or 'equilibrial' region representing the posterior distribution; [link](https://mc-stan.org/docs/reference-manual/analysis.html#split-r-hat-for-detecting-non-stationarity)). $\hat{R} \gg 1$ may capture non-stationarity.
+
+#### Mathematics!
+
+I introduce the most recent definition of $\hat{R}$ (from BDA3; Gelman, Carlin, Stern, Dunson, Vehtari, & Rubin, 2013). Given $m$ chains, each with $n$ samples, you first compute the between- and within-chain variances (denoted as $B$ and $W$, respectively) as follows:
+
+$$B = \frac{n}{m-1} \sum_{j=1}^{m} (\bar{\psi}_{\cdot j} - \bar{\psi}_{\cdot\cdot})^2, \quad W = \frac{1}{m}\sum_{j=1}^m s_j^2$$ where
+
+$$\begin{align}
+\bar{\psi}_{\cdot j} &= \frac{1}{n} \sum_{i=1}^{n} \psi_{ij}, &(\text{chain-wise mean}) \\
+\bar{\psi}_{\cdot \cdot} &= \sum_{j=1}^m \bar{\psi}_{\cdot j} = \frac{1}{n}\sum_{j=1}^m \sum_{i=1}^n \psi_{ij},  & (\text{grand mean}) \\
+s_j^2 &= \frac{1}{n-1}\sum_{i=1}^n (\psi_{ij} - \bar{\psi}_{\cdot j})^2 & (\text{within-chain sample variance)}
+\end{align}$$
+
+The $\hat{R}$ statistic is defined as $$\hat{R} := \frac{(\text{marginal posterior variance})}{(\text{within-chain variance})} = \sqrt{\frac{\frac{n-1}{n} W + \frac{1}{n}B}{W}}=\sqrt{ \frac{n-1}{n} + \frac{1}{n}\frac{B}{W} }.$$ If the chains converged appropriately, the between-chain variance $B$ must not be greater than the within-chain variance $W$, i.e., $B/W \approx 1$. Therefore, the ideal value of $\hat{R}$ with converged chains is $\sqrt{\frac{n-1}{n} + \frac{1}{n}\times 1} = 1$. Practically, it is said that $\hat{R}$ should be smaller than 1.1.
+
+### The number of effective samples
+
+We expect that the chains would not get stuck in any area and would be able to move to any other region. However, posterior samples are usually expected to have autocorrelation to a degree. The position of a chain at step $t$ is correlated with its position at step $t-1$, positively or negatively.
+
+Stan computes an estimate of the number of *effective* samples, `n_eff`. This is an estimate of the number of samples that would have been needed to achieve the same estimation uncertainty as the actual output *if posterior samples did not have autocorrelaton*. If this number is too small compared to the actual number of samples, it means that the posterior samples suffer from autocorrelation, resulting in inefficient sampling from the posterior.
+
+-   See the [link](https://mc-stan.org/docs/reference-manual/analysis.html#effective-sample-size.section)
