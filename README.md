@@ -8,4 +8,9 @@ A repository for R markdown notebooks used in the hands-on Bayesian inference wo
      * Stan + R package `loo`: Posterior predictive assessment measures
          * Widely applicable information criterion (WAIC)
          * Approximate leave-one-out cross-validation (LOOCV): Pareto-smoothing importance sampling (PSIS) LOOCV
- * Week 3 (07/02/2024): TBD
+ * Week 3 (07/02/2024): (Generalized) linear models & Prior/posterior predictive check
+     * A case study: Psychophysical functions (Lee & Wagenmakers, 2013, Chapter 12)
+ * Week 4 (07/16/2024): Hierarchical modeling, covariance modeling
+     * The LKJ distribution as a prior for correlation matrices
+     * The Cholesky decomposition
+     * Partial correlation
