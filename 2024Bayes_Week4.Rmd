@@ -1,0 +1,466 @@
+---
+title: "Bayesian Workshop Week 4"
+output: html_notebook
+---
+
+```{r}
+library("rstan")
+library("loo")
+library("bridgesampling")
+
+install.packages("MASS")
+install.packages("trialr")
+library("MASS")
+library("trialr") # LKJ distribution
+```
+
+# Hierarchical Modeling & Covariance
+
+We have discussed
+
+-   **Stan's basic features**,
+-   **simple modeling cases** (e.g., between-group mean comparison, linear regression, generalized linear models),
+-   **ideal practices for Bayesian inference** (prior and posterior predictive check, sensitivity analysis, model comparison using WAIC/approximate LOOCV/Bayes factor, Savage-Dickey density ratio), and
+-   **technical issues in Hamiltonian Monte Carlo** (e.g., divergent transitions).
+
+We've traveled a long way! This week, we will discuss the following topics that are not exclusively Bayesian but can significantly benefit from Bayesian inference:
+
+-   **Hierarchical modeling**: How can parameters associated with individual datasets inform each other and improve the inference via a hierarchical structure?
+-   **Covariance modeling**: How are variables or parameters are correlated? How does knowing this relationship influence the inference?
+
+This section heavily relies on a hypothetical scenario discussed in **Chapters 13 and 14** of **Statistical Rethinking** (2nd ed) by Richard McElreath.
+
+## Guessing the waiting time at a café
+
+You want to know how long you're going to wait at a café after ordering your drink (getting your daily caffeine intake is important, but you don't want to late for your research meeting!). You drop by several cafés in your area, in the morning or in the afternoon, and record the waiting times. The mean trend for Café $i$ may be modeled as follows:$$\mu_i = \beta_{0, i} + \beta_{1, i} A_i$$ where $A_i \in \{0, 1\}$ indicates whether you visited the café in the afternoon (1) or in the morning (0). For convenience, let's assume that the actual waiting times follow a normal distribution: $$W_{j | i} \sim N(\mu_i, \sigma^2).$$
+
+It is possible that the waiting times in the morning ($\beta_0$) is correlated with the changes in the waiting times in the afternoon ($\beta_1$). In the morning, people flock to cafés in search of caffeine to start their day. If it is a famous café that serves very delicious coffee, you should be prepared for long waiting times in the morning because staff are very busy. However, once the busy time passes, you can get your order much faster. So we can probably play with a scenario that $\beta_0$ and $\beta_1$ is negatively correlated.
+
+### Simulating data
+
+Let's simulate data. To get correlated samples, we will use multivariate normal distribution functions in the R package `MASS`. (`mvtnorm` is another representative R package for multivariate normal and Student's *t* distributions. I will adhere to the setting used in the reference.)
+
+```{r}
+library("MASS")
+
+beta0 = 3.5 # The mean waiting time in the morning
+beta1 = -1 # The changes in the mean waiting time in the afternoon
+sigma_beta0 = 1 # Standard deviation for the waiting time in the morning
+sigma_beta1 = 0.5 # Standard deviation for the waiting time in the afternoon
+rho = -0.7 # Correlation between beta0 and beta1
+
+# For sampling from a multivariate normal distributon
+Mu = c(beta0, beta1)
+sigmas = c(sigma_beta0, sigma_beta1)
+Rho = matrix(c(1, rho, rho, 1), 2, 2)
+Sigma = diag(sigmas) %*% Rho %*% diag(sigmas)
+
+# Sampling the coefficients from 20 cafés
+N_cafes = 20
+
+set.seed(5)
+vary_effects = mvrnorm(N_cafes, Mu, Sigma)
+
+beta0_cafe = vary_effects[,1]
+beta1_cafe = vary_effects[,2]
+
+# Sampling the data points from each café
+set.seed(22)
+N_visits = 10 # 10 data points per café
+afternoon = rep(0:1, N_visits * N_cafes/2) # 5 in the morning, 5 in the afternoon
+cafe_id = rep(1:N_cafes, each = N_visits) # Café indicator
+mu = beta0_cafe[cafe_id] + beta1_cafe[cafe_id] * afternoon # Café-wise mean trend
+sigma = 0.5 # Observation noise standard deviation
+wait = rnorm(N_visits * N_cafes, mu, sigma) # Observed waiting time
+
+# Make a data frame
+d = data.frame(cafe = cafe_id, afternoon = afternoon, wait = wait)
+```
+
+## Models
+
+There are multiple ways to learn about the waiting times. You're going to visit 20 cafés. You might or might not want to take advantage of this information.
+
+-   You can treat each café completely independently. These are all different cafés.
+-   You may think that the waiting times at different cafés share a mean trend. These are cafés, after all. There may be some place-by-place differences, but we're not comparing a café with a fine-dining restaurant. $$\begin{cases}\beta_{0,i} \sim N(\mu_{\beta_0}, \sigma_{\beta_0}^2)\\ \beta_{1,i} \sim N(\mu_{\beta_1}, \sigma_{\beta_1}^2)\end{cases}$$
+-   You may assume a common trend in the waiting times, and also sort of correlation between the waiting time in the morning and the changes in the waiting time in the afternoon. $$\pmatrix{\beta_{0,i} \\ \beta_{1,i}} \sim N \Bigg(\pmatrix{\mu_{\beta_0} \\ \mu_{\beta_1}}, \bigg[\matrix{\sigma_{\beta_0}^2 & \rho\sigma_{\beta_0}\sigma_{\beta_1} \\ \rho\sigma_{\beta_1}\sigma_{\beta_0} & \sigma_{\beta_1}^2}\bigg] \Bigg)$$
+
+We will create models based on each scenario and compare the resulting regression coefficient estimates. For this case study, I will just set a set of priors without further justifications. As before, priors used here are not particularly considering any conjugacy. The only adjustment I made in prior was for [reducing any pathological behavior of HMC observed during the sampling phase]{.underline}.
+
+### (1) Treating each cafe independently
+
+We will first consider the case in which each cafe is independently considered. For simplicity, we will use the ordinary least square (OLS) estimator of the coefficients, which are unbiased. You can calculate the OLS estimates Given a design matrix $\mathbf{X}$ and a response variable $\mathbf{y}$, $$\hat{\beta} = (\mathbf{X}^T \mathbf{X})^{-1}\mathbf{X}^T\mathbf{y}.$$
+
+```{r}
+beta.ols = array(NA, c(N_cafes, 2))
+for (idx.cafe in 1:N_cafes){
+  idx.temp = d$cafe == idx.cafe
+  
+  # The first column is for an intercept term
+  X = cbind(rep(1, 10), d[idx.temp,]$afternoon)
+  
+  # Compute the OLS estimate
+  ## solve(M) gives you an inverse matrix of M.
+  beta.ols[idx.cafe, ] = solve(t(X) %*% X) %*% t(X) %*% d[idx.temp,]$wait
+}
+```
+
+I've already fitted this model using Bayesian inference. If you don't specify any prior on parameters, Stan will automatically set an improper prior exploiting the real number space.[^1] This way, you can get a Bayesian analog of the OLS estimate by taking the mean of the posterior samples. You can see that the closed-form OLS estimate and the Bayesian analog aligns well.
+
+[^1]: Stan uses a uniform prior that can become improper if a parameter's domain has no finite upper or lower bounds. For example, any parameters that are positively bounded (e.g., standard deviation) is assigned a uniform distribution $U(0, \infty)$.
+
+```{r}
+load("cafe_independent.Rdata")
+```
+
+```{r}
+par(mfrow = c(1,2))
+plot(beta.ols[,1], beta.ols.bayes[,1,1], pch = 16, col = rgb(0,0,0,0.3), cex = 1.5,
+     main = "Intercept", xlab = "Closed-form OLS estimate", ylab = "Bayesian analog")
+curve(1 * x, lty = 2, col = "grey", add = T)
+plot(beta.ols[,2], beta.ols.bayes[,2,1], pch = 16, col = rgb(0,0,0,0.3), cex = 1.5,
+     main = "Slope", xlab = "Closed-form OLS estimate", ylab = "Bayesian analog")
+curve(1 * x, lty = 2, col = "grey", add = T)
+```
+
+### (2) Hierarchical modeling without considering covariance
+
+Next, let's assume that each beta coefficient follows a normal distribution that describes group-level information: $$\beta_{0,i} \sim N(\mu_{\beta_0}, \sigma_{\beta_0}^2),\quad \beta_{1,i} \sim N(\mu_{\beta_1}, \sigma_{\beta_1}^2).$$ However, how $\beta_0$ and $\beta_1$ are related is not of our interest.
+
+```{r}
+m1.h1.statement = "
+data {
+  int N_cafes;
+  int N_visits;
+  matrix[N_visits, N_cafes] cafe;
+  matrix[N_visits, N_cafes] afternoon;
+  matrix[N_visits, N_cafes] wait_time;
+}
+
+parameters {
+  matrix[N_cafes, 2] beta;
+  vector[2] mu_beta;
+  vector[2] sigma_beta;
+  real sigma;
+}
+
+model {
+  for (i in 1:N_cafes){
+    for (j in 1:N_visits){
+      wait_time[j,i] ~ normal(beta[i,1] + beta[i,2] * afternoon[j,i], sigma);
+    }
+    beta[i,1] ~ normal(mu_beta[1], sigma_beta[1]);
+    beta[i,2] ~ normal(mu_beta[2], sigma_beta[2]);
+  }
+  
+  mu_beta ~ normal(0, 3);
+  sigma_beta ~ inv_gamma(2,1);
+  sigma ~ inv_gamma(2,1);
+}
+"
+
+model1.h1 = stan_model(model_code = m1.h1.statement)
+fit1.h1 = sampling(model1.h1, 
+                data = list(N_cafes = N_cafes, N_visits = N_visits, 
+                            cafe = matrix(d$cafe, 10, 20),
+                            afternoon = matrix(d$afternoon, 10, 20), 
+                            wait_time = matrix(d$wait, 10, 20)), 
+                iter = 10000,
+                chains = 4, cores = 4)
+post1.h1 = extract(fit1.h1)
+
+# Compute the mean estimate of beta
+beta.h1 = array(NA, c(N_cafes, 2, 2))
+beta.h1[,,1] = apply(post1.h1$beta, c(2, 3), mean)
+beta.h1[,,2] = apply(post1.h1$beta, c(2, 3), sd)
+```
+
+### (3) Hierarchical modeling considering covariance
+
+Now we want to explicitly take how $\beta_0$ (waiting time in the morning) and $\beta_1$ (changes in the waiting time in the afternoon) are related via their group-level hyperparameters. Statistically, we're modeling the **covariance** between $\mu_{\beta_0}$ and $\mu_{\beta_1}$.
+
+We have already declared standard deviation parameters for the group-level distribution, $\sigma_{\beta_0}$ and $\sigma_{\beta_1}$. With an appropriate positive semi-definite matrix $\mathbf{R}_{(2\times 2)}$ whose diagonal elements are fixed to one and off-diagonal elements are in $[-1, 1]$, we can get a covariance matrix for the group-level distribution as follows: $$\mathbf{\Sigma} = \big(\text{diag}(\sigma_{\beta_0},\sigma_{\beta_1})\big)\mathbf{R}\big(\text{diag}(\sigma_{\beta_0},\sigma_{\beta_1})\big),\\
+\pmatrix{\beta_{0,i} \\ \beta_{1,i}}\sim N\Bigg( \pmatrix{\mu_{\beta_0} \\ \mu_{\beta_1}}, \mathbf{\Sigma}\Bigg)$$
+
+An inverse Wishart distribution is often used as a prior for a covariance matrix. Equivalently, a Wishart distribution is often used as a prior for a precision matrix (an inverse matrix of the covariance matrix). One of the reasons is that, within a regression modeling context with a Gaussian likelihood model, a (multivariate) normal prior for the regression coefficient and an inverse Wishart prior for the covariance matrix is a conjugate prior. This means that there is a closed-form solution of Bayesian updating in regression coefficients and their covariance matrix. However, an (inverse) Wishart distribution as a prior for covariance (or precision) may produce [numerical issues because of its heavy-tailedness](https://github.com/pymc-devs/pymc/issues/538#issuecomment-94153586).
+
+An **LKJ (Lewandowski-Kurowicka-Joe) distribution** ([link](https://en.wikipedia.org/wiki/Lewandowski-Kurowicka-Joe_distribution)) has been proposed as an alternative prior for the correlation matrix. This distribution has one shape parameter $\eta \in (0, \infty)$. How does this shape parameter influence the distribution of correlation?
+
+```{r}
+library("trialr")
+
+n.lkj.sample = 10000
+etas = c(0.1, 0.5, 1, 4, 16, 50)
+
+lkj.corr.arr = array(NA, c(n.lkj.sample, length(etas)))
+for (idx.eta in 1:length(etas)){
+  temp.R = rlkjcorr(n.lkj.sample, 2, etas[idx.eta])
+  lkj.corr.arr[,idx.eta] = temp.R[,1,2]
+}
+```
+
+```{r fig.height=5, fig.width=7}
+plot(NULL, xlim = c(-1, 1), ylim = c(-0.25, 6),
+     xlab = "Correlation", ylab = "Density", main = "Samples from LKJ")
+for (idx.eta in 1:length(etas)){
+  temp.dens = density(lkj.corr.arr[,idx.eta], adjust = 0.2)
+  lines(temp.dens, lwd = 3, col = "grey")
+  lines(temp.dens, lwd = 2.5, col = rev(rainbow(length(etas)+1))[idx.eta+1])
+}
+text(x = -0.85, y = 5.5, "eta = 0.1", col = rev(rainbow(length(etas)+1))[1+1])
+text(x = -0.6, y = 0.9, "eta = 1", col = rev(rainbow(length(etas)+1))[3+1])
+text(x = 0, y = 4.5, "eta = 50", col = rev(rainbow(length(etas)+1))[6+1])
+
+```
+
+The kernel density plot illustrates the characteristics of the LKJ distribution as follows:
+
+-   $\eta < 1$: Perfect negative or positive correlation is more likely.
+-   $\eta = 1$: All possible correlation values are equally likely.
+-   $\eta > 1$: Zero or weak correlation is more likely.
+
+Using this LKJ distribution as a prior for the correlation matrix, let's implement the model code.
+
+```{r}
+m1.h2.statement = "
+data {
+  int N_cafes;
+  int N_visits;
+  matrix[N_visits, N_cafes] cafe;
+  matrix[N_visits, N_cafes] afternoon;
+  matrix[N_visits, N_cafes] wait_time;
+}
+
+parameters {
+  matrix[N_cafes, 2] beta;
+  vector[2] mu_beta;
+  vector[2] sigma_beta;
+  corr_matrix[2] R;
+  real sigma;
+}
+
+model {
+  matrix[2,2] Sigma;
+  //Sigma <- quad_form_sym(R, diag_matrix(sigma_beta));
+  Sigma <- quad_form_diag(R, sigma_beta);
+  
+  for (i in 1:N_cafes){
+    for (j in 1:N_visits){
+      wait_time[j,i] ~ normal(beta[i,1] + beta[i,2] * afternoon[j,i], sigma);
+    }
+    beta[i,:] ~ multi_normal(mu_beta, Sigma);
+  }
+  
+  mu_beta ~ normal(0, 3);
+  sigma_beta ~ inv_gamma(2,1);
+  R ~ lkj_corr(2);
+  sigma ~ inv_gamma(2,1);
+}
+"
+
+model1.h2 = stan_model(model_code = m1.h2.statement)
+fit1.h2 = sampling(model1.h2, 
+                   data = list(N_cafes = N_cafes, N_visits = N_visits, 
+                               cafe = matrix(d$cafe, 10, 20),
+                               afternoon = matrix(d$afternoon, 10, 20), 
+                               wait_time = matrix(d$wait, 10, 20)), 
+                   iter = 10000,
+                   chains = 4, cores = 4)
+post1.h2 = extract(fit1.h2)
+
+beta.h2 = array(NA, c(N_cafes, 2, 2))
+beta.h2[,,1] = apply(post1.h2$beta, c(2, 3), mean)
+beta.h2[,,2] = apply(post1.h2$beta, c(2, 3), sd)
+```
+
+There are a few things to pay attention to or be careful about when implementing this model.
+
+-   `corr_matrix[2] R`: In general, a data type `matrix[n_row, n_col]` is used for declaring a matrix variable. However, correlation and covariance matrices require specialized data types that satisfy the assumption of positive semi-definiteness: `corr_matrix[dimension]`, `cov_matrix[dimension]`.
+-   `quad_form`, `quad_form_diag`, `quad_form_sym`: To obtain the covariance matrix from dimension-wise variance parameters and a correlation matrix, you need to compute the following quadratic form $$\mathbf{\Sigma} = \mathbf{S}^T \mathbf{R}\mathbf{S}$$ where $\mathbf{R}$ is a correlation matrix and $\mathbf{S}$ is a diagonal matrix whose diagonal elements are dimension-wise variance terms.
+    -   `quad_form(A, B)` computes a general quadratic form $\mathbf{\Sigma} = \mathbf{B}^T \mathbf{A}\mathbf{B}$ for you. The first argument must be a square matrix, and the second argument can be either a matrix or a vector. If the second argument is a vector, the vector is used without any further transformation.
+    -   `quad_form_diag(matrix A, vector b)` computes a quadratic form after transforming a vector into a diagonal matrix.
+    -   `quad_form_sym(A, B)` works like `quad_form(A, B)` but checks whether the first argument $\mathbf{A}$ is symmetric and also the output is symmetric.
+    -   In our case, given a vector of variance parameters `sigma_beta` and a correlation matrix `R`, you can use one of the two options: `Sigma <- quad_form_diag(R, sigma_beta)` or `Sigma <- quad_form_sym(R, diag_matrix(sigma_beta))`.
+
+### (3') Cholesky decomposition
+
+In fact, using the LKJ distribution as it is the second best recommendation in MCMC-based Bayesian inference. It is well known that any positive semi-definite matrix can be decomposed into a lower-triangular matrix and its transpose (**Cholesky decomposition**):
+
+$$\mathbf{\Sigma} = \mathbf{L}\mathbf{L}^T \qquad (\mathbf{L}\text{: lower triangular}).$$ It is also known that multiplying this Cholesky factor (i.e., the lower-triangular matrix obtained from the Cholesky decomposition), $\mathbf{L}$, to a vector of uncorrelated samples, $\mathbf{u}$, allows you to get the samples with the covariance structure quantified as $\mathbf{\Sigma}$. Using the Cholesky decomposition for sampling is known to be more efficient and numerically stable than using the original covariance/correlation distribution as it is.
+
+Let's test the idea of Cholesky-factor-based sampling.
+
+```{r}
+Sigma.chol = matrix(c(1, 0.5, 0.5, 1), 2, 2)
+
+# R's Cholesky decomposition function (chol) returns an upper-triangular matrix.
+# You can simplify the calculation with an upper-triangular output,
+# but let's adhere to the original procedure for now.
+# You first need to transpose the output.
+U.chol = chol(Sigma.chol) # an upper-triangular output
+L.chol = t(U.chol) # in short, t(chol(Sigma.chol))
+
+# Generate vectors of uncorrelated samples
+n.chol.samples = 2000
+set.seed(12345)
+Us = cbind(rnorm(n.chol.samples, 0, 1), rnorm(n.chol.samples, 0, 1))
+## equivalently, using the R package "MASS",
+# Us = mvrnorm(n.chol.samples, c(0,0), diag(c(1,1)))
+
+# Cholesky factor multiplied by vectors of uncorrelated samples
+LUs = t(L.chol %*% t(Us))
+## 1. %*% is a matrix multiplication operator in R.
+## 2. You need to transpose Us first to match dimensionality for matrix multiplication.
+## 3. You can get the same result by Us %*% U.chol because t(A %*% B) = t(B) %*%t(A).
+
+# Plot
+par(mfrow = c(1,2))
+plot(Us, xlim = c(-4, 4), ylim = c(-4, 4),
+     xlab = "Dim 1", ylab = "Dim 2", main = "Uncorrelated samples",
+     pch = 16, col = rgb(0,0,0,0.1))
+text(x = -4, y = 4, paste("Cor =", round(cor(Us)[1,2], 3)), pos = 4)
+plot(LUs, xlim = c(-4, 4), ylim = c(-4, 4),
+     xlab = "Dim 1", ylab = "Dim 2", main = "LUs",
+     pch = 16, col = rgb(0,0,0,0.1))
+text(x = -4, y = 4, paste("Cor =", round(cor(LUs)[1,2], 3)), pos = 4)
+```
+
+Let's implement the model using the Cholesky decomposition.
+
+```{r}
+m1.h3.statement = "
+data {
+  int N_cafes;
+  int N_visits;
+  matrix[N_visits, N_cafes] cafe;
+  matrix[N_visits, N_cafes] afternoon;
+  matrix[N_visits, N_cafes] wait_time;
+}
+
+parameters {
+  matrix[N_cafes, 2] beta;
+  vector[2] mu_beta;
+  vector[2] sigma_beta;
+  cholesky_factor_corr[2] L;
+  real sigma;
+}
+
+model {
+  matrix[2,2] Sigma;
+  Sigma <- quad_form_sym(L * L', diag_matrix(sigma_beta));
+  for (i in 1:N_cafes){
+    for (j in 1:N_visits){
+      wait_time[j,i] ~ normal(beta[i,1] + beta[i,2] * afternoon[j,i], sigma);
+    }
+    beta[i,:] ~ multi_normal(mu_beta, Sigma);
+  }
+  
+  mu_beta ~ normal(0, 3);
+  sigma_beta ~ inv_gamma(2,1);
+  L ~ lkj_corr_cholesky(2);
+  sigma ~ inv_gamma(2,1);
+}
+"
+
+model1.h3 = stan_model(model_code = m1.h3.statement)
+fit1.h3 = sampling(model1.h3, 
+                   data = list(N_cafes = N_cafes, N_visits = N_visits, 
+                               cafe = matrix(d$cafe, 10, 20),
+                               afternoon = matrix(d$afternoon, 10, 20), 
+                               wait_time = matrix(d$wait, 10, 20)), 
+                   iter = 10000,
+                   chains = 4, cores = 4)
+post1.h3 = extract(fit1.h3)
+
+beta.h3 = array(NA, c(N_cafes, 2, 2))
+beta.h3[,,1] = apply(post1.h3$beta, c(2, 3), mean)
+beta.h3[,,2] = apply(post1.h3$beta, c(2, 3), sd)
+```
+
+-   `cholesky_factor_corr[2] L`: Now, we're modeling not a correlation matrix directly but its Cholesky factor. Accordingly, a specialized data type `cholesky_factor_corr` must be used.
+-   `L ~ lkj_corr_cholesky(2)`: Similarly, a specialized prior `lkj_corr_cholesky` must be used for the Cholesky factor from the LKJ distribution.
+-   `quad_form`, `quad_form_diag`, and `quad_form_sym` requires a legitimate correlation matrix for its first term. It means that we need to recover the Cholesky factor into its original form of a correlation matrix. This can be simply dones by `L * L'`.
+    -   If `A` and `B` are matrices, `A * B` computes matrix multiplication, not element-wise multiplication.
+    -   If `A` is a matrix, `A'` gives you a transpose of `A`.
+
+## Results
+
+We obtained the OLS estimates from individual cafes and the estimates from Bayesian hierarchical models.
+
+### Regression coefficients and shrinkage
+
+Let's plot the coefficient estimates from all models.
+
+```{r fig.height=7, fig.width=7}
+plot(beta.ole.bayes[,1,1], beta.ole.bayes[,2,1], pch = 16, col = "grey",
+     xlab = "Waiting time: Morning", ylab = "Changes in the 
+     waiting time: Afternoon")
+points(beta.h1[,1,1], beta.h1[,2,1], pch = 15, col = "blue")
+points(beta.h2[,1,1], beta.h2[,2,1], pch = 2, cex = 1.5, col = "orange")
+points(beta.h3[,1,1], beta.h3[,2,1], pch = 17, col = "red")
+for (i in 1:N_cafes){
+  lines(x = c(beta.ole.bayes[i,1,1], beta.h1[i,1,1]),
+        y = c(beta.ole.bayes[i,2,1], beta.h1[i,2,1]), col = "blue")
+  lines(x = c(beta.ole.bayes[i,1,1], beta.h2[i,1,1]),
+        y = c(beta.ole.bayes[i,2,1], beta.h2[i,2,1]), col = "orange")
+  lines(x = c(beta.ole.bayes[i,1,1], beta.h3[i,1,1]),
+        y = c(beta.ole.bayes[i,2,1], beta.h3[i,2,1]), col = "red")
+}
+points(x = mean(post1.h1$mu_beta[,1]), y = mean(post1.h1$mu_beta[,2]),
+       pch = 3, col = "blue", lwd = 3, cex = 2)
+points(x = mean(post1.h3$mu_beta[,1]), y = mean(post1.h3$mu_beta[,2]),
+       pch = 4, col = "red", lwd = 3, cex = 2)
+legend("topright", inset = 0.01,
+       pch = c(16, 15, 2, 17), col = c("grey", "blue", "orange", "red"), pt.cex = 1.5,
+       c("OLS", "Hierarchical, no covariance", "Hierarchical, LKJ", "Hierarchical, LKJ + Cholesky"))
+legend("bottomleft", inset = 0.01,
+       pch = c(3, 4), col = c("blue", "red"), lty = NA, pt.cex = 1.25, lwd = 3,
+       c("mu_beta: No covariance", "mu_beta: LKJ + Cholesky"))
+```
+
+Some important observations:
+
+-   You can find that $\beta_0$ and $\beta_1$ are negatively correlated, as we intended in the data simulation step.
+-   Compared to the OLS estimates, the estimates from the hierarchical models are *shrunken* toward a certain mean trend.
+-   The degree of *shrinkage* is different depending on whether covariance is explicitly modeled or not.
+
+The *shrinkage* of the estimate are often observed in hierarchical modeling. It is the result that model parameters for individual cafés are informed by each other. You can see the shrinkage as a result of 'partial pooling': We want to see the general trend of the waiting time but also admit the presence of between-café differences.
+
+However, we know that the OLS estimator is unbiased, which seems kind of ideal. Then, what's the point of introducing (seeminly unnecessary) biases to parameter estimates?
+
+The following plots show the distribution of the posterior standard deviation of each parameter. You can find that the Bayesian OLS estimates from many cafés have relatively large standard deviation, meaning high uncertainty. By contrast, the uncertainty in the estimates from hierarchical models has reduced in general.
+
+```{r fig.height=8, fig.width=6}
+par(mfrow = c(2,1))
+plot(density(beta.h1[,2,2]), xlim = c(0, 0.7), col = "blue", lwd = 3,
+     main = "Intercept", xlab = "Posterior SD")
+lines(density(beta.h3[,2,2]), col = "red", lwd = 3)
+lines(density(beta.ols.bayes[,2,2]), col = "grey", lwd = 3)
+legend("topright", inset = 0.01,
+       pch = 15, col = c("grey", "blue", "red"),
+       c("Unbiased estimator", "Hierarchical, no covariance", "Hierarchical, covariance"))
+
+plot(density(beta.h1[,1,2]), xlim = c(0, 0.5), col = "blue", lwd = 3,
+     main = "Slope", xlab = "Posterior SD")
+lines(density(beta.h3[,1,2]), col = "red", lwd = 3)
+lines(density(beta.ols.bayes[,1,2]), col = "grey", lwd = 3)
+```
+
+A major advantage of hierarchical modeling (and more generally, shrinkage methods) is that you can reduce the variance of the estimates by introducing bias. High variance in the model parameters imply that the model is sensitive to minor random noises in data, and therefore, often result in overfitting. Lowering variance in the estimate addresses this problem (as far as the cost of additional bias is smaller than the benefit from lowering variance).[^2]
+
+[^2]: The advantage of hierarchical modeling (and more generally, shrinkage methods) is related to the so-called **bias-variance tradeoff** ([link](https://en.wikipedia.org/wiki/Bias%E2%80%93variance_tradeoff)).
+
+### Covariance
+
+We can also extract the full posterior distribution of the correlation between the intercept and slope parameters in the hierarchical models considering covariance because we treated this correlation as another random variable. The posterior distribution captures the ground truth with a credibly high posterior density.
+
+```{r}
+plot(density(post1.h2$R[,1,2]), xlim = c(-1, 1), lwd = 3, col = "orange",
+     xlab = "Correlation", main = "Correlation: Coefficients")
+lines(density(apply(post1.h3$L, 1, function(X) (X %*% t(X))[1,2])), 
+      lwd = 3, col = "red")
+abline(v = rho, lty = 1, lwd = 3, col = "black")
+legend("topright", inset = 0.01,
+       lty = 1, col = c("orange", "red", "black"), lwd = 3,
+       c("Hierarchical, LKJ", "Hierarchical, LKJ + Cholesky","Ground truth"))
+```

@@ -1,0 +1,715 @@
+---
+title: "Bayes Workshop Week 3"
+output: html_notebook
+---
+
+```{r}
+library("rstan")
+library("loo")
+library("bridgesampling")
+
+install.packages("logspline")
+library("logspline")
+```
+
+# Regression Modeling in Stan
+
+In the last two sessions, we have modeled observed data using a Gaussian distribution with mean and standard deviation, without further delving into how the mean (and standard deviation, if it is also part of your interest) is constructed.
+
+Regression modeling aims to explain the association between a (set of) variable with another where the former ("predictors", "regressors", ...) determines the mean trend of the latter ("response variable", "predicted variable", ...). This week, we will explore the following topics within the regression modeling framework.
+
+-   Model assessment: **Prior and posterior predictive check**
+    -   *"Unbiased" prior*?
+-   Model comparison
+    -   Review: Is your model valid (compared to the *null* model)?
+    -   *Savage-Dickey density ratio*: $\beta=0$?
+-   Stan's features for generalized linear models
+
+# Case 1: Simple linear regression
+
+One of the R's default datasets, `cars`, contains the speed of cars and the distances taken to stop.
+
+```{r fig.height=5, fig.width=5}
+data(cars)
+dat = cars
+
+plot(dat$speed, dat$dist, pch = 16, col = rgb(0,0,0,0.3), cex = 1.5,
+     main = "cars", xlab = "Speed", ylab = "Distances taken to stop")
+```
+
+## Model specification & Prior predictive check
+
+Let's model the relationship between the speed and stopping distance using linear regression: $$D_i \sim N(\mu_i, \sigma^2), \qquad \mu_i = \beta_0 + \beta_1 S_i.$$ A linear regression model is probably the worst one you can consider for this specific dataset. I'm still going to use linear regression only for demonstrative purposes.
+
+-   **Note: The following subsections were heavily motivated by Chapter 4 of McElreath (2020), *Statistical Rethinking*.**
+
+### Conventional "unbiased" priors
+
+We will use "unbiased" and diffuse prior distributions for model parameters: $$\beta_0 \sim N(0, 10), \\ \beta_1 \sim N(0, 10), \\ \sigma \sim \text{InvGamma}(0.001, 0.001).$$
+
+Although it is relatively less emphasized in practice, it is important to check the predictions allowed by prior distributions **before taking a look into a dataset**. You may have a good sense of prior predictions for linear models that we're already used to, but your model may produce predictions that are completely counterintuitive (especially if the model is nonlinear). You may want to know
+
+-   Isn't our model too constrained?
+-   Isn't the model making predictions that does not make sense, regardless of the observed data?
+
+Although you can let Stan handle prior predictive check, it requires some tweaks in the model statement and Stan functions. I also simply find that writing code in R is much easier.
+
+```{r}
+n.sample = 1000
+set.seed(1)
+temp.speed = seq(0, 30, 1)
+
+# Sample parameters from the prior
+beta0 = rnorm(n.sample, 0, 10)
+beta1 = rnorm(n.sample, 0, 10)
+
+prior.pred.arr = array(NA, c(length(temp.speed), n.sample))
+plot(NULL, xlim = c(0, 30), ylim = c(-100, 100), 
+     xlab = "Speed", ylab = "Distance to stop",
+     main = "Mean trend predicted by the prior")
+for (i in 1:n.sample){
+  # Plot a predicted function from each prior sample
+  prior.pred.arr[,i] = beta0[i] + beta1[i] * temp.speed
+  lines(temp.speed, prior.pred.arr[,i], type = "l", 
+        lty = 1, col = rgb(0,0,0,0.1))
+}
+# Average prediction
+lines(temp.speed, rowMeans(prior.pred.arr), lwd = 3, col = "red")
+
+legend("topright", inset = 0.01, 
+       lty = 1, lwd = c(1, 3), col = c(rgb(0,0,0,0.5), "red"),
+       c("From prior samples", "Average prediction"))
+```
+
+The prior predictive simulation shows the followings:
+
+-   The distance required to stop at speed = 0 is centered at zero and sy mmetrically distributed.
+-   The model can predict negative distance to stop.
+
+Even without any knowledge of physics, the simulation raises a critical concern: **Distance cannot be negative.** Also, if you want to consider the domain knowledge of physics, we already know that stopping distance is positively associated with speed. We might have to keep the assumption that stopping distance at speed = 0 can be negative due to how our model simplifies reality. However, the other two concerns might not be trivial.
+
+This example shows that using a conventional "unbiased" prior without careful thinking may cause problems because it can allow predictions that contradict the domain knowledge researchers rely on.
+
+-   Must domain knowledge be always prioritized? Or unbiasedness in numbers, even if superficial, is still valuable?
+-   If we were to incorporate domain knowledge into prior specification, to what extent?
+
+These are issues we can discuss.
+
+### Priors minimally informed by domain knowledge
+
+Considering the discussion above, I will fit a model with a different set of priors in this tutorial:
+
+$$\beta_0 \sim N(0, 10), \\ \beta_1 \sim \text{LogNormal}(0, 5), \\ \sigma \sim \text{InvGamma}(0.001, 0.001).$$
+
+```{r}
+n.sample = 1000
+set.seed(1)
+temp.speed = seq(0, 30, 1)
+
+# Sample parameters from the prior
+beta0 = rnorm(n.sample, 0, 10)
+beta1 = exp(rnorm(n.sample, 0, 3)) # equivalent to sampling from a lognormal distribution
+
+prior.pred.arr = array(NA, c(length(temp.speed), n.sample))
+plot(NULL, xlim = c(0, 30), ylim = c(-50, 150), 
+     xlab = "Speed", ylab = "Distance to stop",
+     main = "Mean trend predicted by the prior")
+for (i in 1:n.sample){
+  # Plot a predicted function from each prior sample
+  prior.pred.arr[,i] = beta0[i] + beta1[i] * temp.speed
+  lines(temp.speed, prior.pred.arr[,i], type = "l", 
+        lty = 1, col = rgb(0,0,0,0.1))
+}
+# Average prediction
+lines(temp.speed, rowMeans(prior.pred.arr), lwd = 3, col = "red")
+
+legend("topright", inset = 0.01, 
+       lty = 1, lwd = c(1, 3), col = c(rgb(0,0,0,0.5), "red"),
+       c("From prior samples", "Average prediction"))
+```
+
+### Strongly constrained intercept
+
+In the previous two models, I allowed the intercept representing the stopping distance at speed of zero to be negative. Acknowledging that linearity is the worst assumption that we can make to describe the data, I intentionally imposed this unrealistic assumption only for a demonstrative purpose.
+
+However, let's say we don't even want to work with such an artificial assumption from the beginning. We want to make the intercept always positiv. We want to make the intercept as close to zero as possible, but it might be too harsh considering the expected approximation error. So let's allow some freedom in the intercept priro. Say,
+
+$$\beta_0 \sim \text{LogNormal}(0, 2), \\ \beta_1 \sim \text{LogNormal}(0, 5), \\ \sigma \sim \text{InvGamma}(0.001, 0.001).$$
+
+```{r}
+n.sample = 1000
+set.seed(1)
+temp.speed = seq(0, 30, 1)
+
+# Sample parameters from the prior
+beta0 = exp(rnorm(n.sample, 0, 2))
+beta1 = exp(rnorm(n.sample, 0, 5)) # equivalent to sampling from a lognormal distribution
+
+prior.pred.arr = array(NA, c(length(temp.speed), n.sample))
+plot(NULL, xlim = c(0, 30), ylim = c(-50, 150), 
+     xlab = "Speed", ylab = "Distance to stop",
+     main = "Mean trend predicted by the prior")
+for (i in 1:n.sample){
+  # Plot a predicted function from each prior sample
+  prior.pred.arr[,i] = beta0[i] + beta1[i] * temp.speed
+  lines(temp.speed, prior.pred.arr[,i], type = "l", 
+        lty = 1, col = rgb(0,0,0,0.1))
+}
+# Average prediction
+lines(temp.speed, rowMeans(prior.pred.arr), lwd = 3, col = "red")
+
+legend("topright", inset = 0.01, 
+       lty = 1, lwd = c(1, 3), col = c(rgb(0,0,0,0.5), "red"),
+       c("From prior samples", "Average prediction"))
+```
+
+### Prior predictive check and *p*-hacking
+
+A specification of prior distributions must be independent of data to be analyzed. You may incorporate prior knowledge from your research domain or previous studies. However, if you adjust your prior to make the model explain the data *in your hand* better, it is no different from p-hacking in frequentist statistics.
+
+## Model fitting
+
+Let's fit the models. We will evaluate the log predictive likelihood for model comparisons.
+
+### Model 1A: A normal prior on the slope parameter
+
+```{r}
+m1a.statement = "
+data {
+  int n;
+  real speed[n];
+  real distance[n];
+}
+
+parameters {
+  vector[2] beta;
+  real sigma;
+}
+
+model {
+  // You can declare a variable within the model block.
+  // Variables newly declared inside the model block will not be sampled.
+  vector[n] mu;
+  for (i in 1:n){
+    mu[i] <- beta[1] + beta[2] * speed[i];
+    distance[i] ~ normal(mu[i], sigma);
+  }
+  beta ~ normal(0, 10);
+  sigma ~ inv_gamma(0.001, 0.001);
+}
+
+generated quantities {
+  vector[n] log_lik; 
+  for (i in 1:n){
+    log_lik[i] = normal_lpdf(distance[i] | beta[1] + beta[2] * speed[i], sigma);
+  }
+}
+"
+
+model1a = stan_model(model_code = m1a.statement)
+fit1a = sampling(model1a, 
+                 data = list(n = nrow(dat), speed = dat$speed, distance = dat$dist), 
+                 iter = 2000,
+                 chains = 4, cores = 4)
+
+```
+
+### Model 1B: A lognormal prior on the slope parameter
+
+```{r}
+m1b.statement = "
+data {
+  int n;
+  real speed[n];
+  real distance[n];
+}
+
+parameters {
+  vector[2] beta;
+  real sigma;
+}
+
+model {
+  vector[n] mu;
+  for (i in 1:n){
+    mu[i] <- beta[1] + beta[2] * speed[i];
+    distance[i] ~ normal(mu[i], sigma);
+  }
+  beta[1] ~ normal(0, 10);
+  beta[2] ~ lognormal(0, 5);
+  sigma ~ inv_gamma(0.001, 0.001);
+}
+
+generated quantities {
+  vector[n] log_lik; 
+  for (i in 1:n){
+    log_lik[i] = normal_lpdf(distance[i] | beta[1] + beta[2] * speed[i], sigma);
+  }
+}
+"
+
+model1b = stan_model(model_code = m1b.statement)
+fit1b = sampling(model1b, 
+                 data = list(n = nrow(dat), speed = dat$speed, distance = dat$dist), 
+                 iter = 2000,
+                 chains = 4, cores = 4)
+
+```
+
+### Model 1C: A lognormal slope + An exponential intercept
+
+```{r}
+m1c.statement = "
+data {
+  int n;
+  real speed[n];
+  real distance[n];
+}
+
+parameters {
+  vector[2] beta;
+  real sigma;
+}
+
+model {
+  vector[n] mu;
+  for (i in 1:n){
+    mu[i] <- beta[1] + beta[2] * speed[i];
+    distance[i] ~ normal(mu[i], sigma);
+  }
+  beta[1] ~ lognormal(0, 2);
+  beta[2] ~ lognormal(0, 5);
+  sigma ~ inv_gamma(0.001, 0.001);
+}
+
+generated quantities {
+  vector[n] log_lik; 
+  for (i in 1:n){
+    log_lik[i] = normal_lpdf(distance[i] | beta[1] + beta[2] * speed[i], sigma);
+  }
+}
+"
+
+model1c = stan_model(model_code = m1c.statement)
+fit1c = sampling(model1c, 
+                 data = list(n = nrow(dat), speed = dat$speed, distance = dat$dist), 
+                 iter = 2000,
+                 chains = 4, cores = 4)
+
+```
+
+#### Divergent transition
+
+Note that Model 1C produces **divergent transitions**, one of the representative pathological behavior of Hamiltonian Monte Carlo.
+
+As mentioned briefly before, Hamiltonian Monte Carlo was built based on the idea of Hamiltonian mechanics. To make sampling in a high-dimensional space as efficient as possible, we want to make each 'particle' move along the so-called *typical set*, a region between the mode with high density and extremely small volume and the tails with near-zero density and extremely large volume. If we only consider the target probability density, 'particles' will be pulled toward the mode HMC achieves the goal of sampling from a typical set by introducing an auxiliary mechanism -- the momentum that works against the "gravity" toward the mode. If the "gravity" toward the mode and the momentum are well balanced, 'particles' will move along the typical set and sample from the posterior efficiently.
+
+This general approach is implemented using the Hamiltonian equation. The Hamiltonian specifies the total energy of a system, consisting of kinetic energy and potential energy. In our case, the posterior density is the total energy, which can be decomposed into the "gravity" toward the mode and the auxiliary momentum, respectively corresponding to potential and kinetic energy. This physics analogy works under the assumption of energy conservation: The total amount of energy in the system does not change. However, in numerical simulation like MCMC, this can be assumed but is not guaranteed. We find **divergent transitions** if this energy convervation assumption is violated.
+
+For now, we will focus on how to fix this problem. Please check the following references:
+
+-   [Stan Development Team (2022). Runtime warnings and convergence problems](https://mc-stan.org/misc/warnings.html)
+-   [Martin Modrák (2018). Taming divergences in Stan models](https://www.martinmodrak.cz/2018/02/19/taming-divergences-in-stan-models/)
+-   Also see: [Michael Betancourt (2018). A conceptual introduction to Hamiltonian Monte Carlo](https://arxiv.org/abs/1701.02434)
+
+There are multiple ways to solve the divergent transition problem. You might want to employ more constrained priors. You can also consider reparameterizing your model, as I did below. Here, I changed the model specification as follows by sampling $\beta_1$ from a normal distribution and then exponentiating it: $$D_i \sim N(\exp(\beta_0) + \beta_1S_i, \sigma^2),\\
+\cdots,\\
+\beta_0 \sim N(0, 2).$$
+
+You can see that the number of divergent transitions has significantly decreased, although there is room for further improvement.
+
+```{r}
+m1c.statement = "
+data {
+  int n;
+  real speed[n];
+  real distance[n];
+}
+
+parameters {
+  vector[2] beta;
+  real sigma;
+}
+
+model {
+  vector[n] mu;
+  for (i in 1:n){
+    mu[i] <- exp(beta[1]) + beta[2] * speed[i];
+    distance[i] ~ normal(mu[i], sigma);
+  }
+  beta[1] ~ normal(0, 2);
+  beta[2] ~ lognormal(0, 5);
+  sigma ~ inv_gamma(0.001, 0.001);
+}
+
+generated quantities {
+  vector[n] log_lik; 
+  for (i in 1:n){
+    log_lik[i] = normal_lpdf(distance[i] | beta[1] + beta[2] * speed[i], sigma);
+  }
+}
+"
+
+model1c = stan_model(model_code = m1c.statement)
+fit1c = sampling(model1c, 
+                 data = list(n = nrow(dat), speed = dat$speed, distance = dat$dist), 
+                 iter = 2000,
+                 chains = 4, cores = 4)
+
+```
+
+### A 'null' model: Only The grand mean of the response variable matters
+
+I fitted a 'null' model that explains the observed stopping distance only by its grand mean.
+
+```{r}
+m1_null.statement = "
+data {
+  int n;
+  real speed[n];
+  real distance[n];
+}
+
+parameters {
+  vector[1] beta;
+  real sigma;
+}
+
+model {
+  vector[n] mu;
+  for (i in 1:n){
+    mu[i] <- beta[1];
+    distance[i] ~ normal(mu[i], sigma);
+  }
+  beta ~ normal(0, 10);
+  sigma ~ inv_gamma(0.001, 0.001);
+}
+
+generated quantities {
+  vector[n] log_lik; 
+  for (i in 1:n){
+    log_lik[i] = normal_lpdf(distance[i] | beta[1], sigma);
+  }
+}
+"
+
+model1_null = stan_model(model_code = m1_null.statement)
+fit1_null = sampling(model1_null, 
+                 data = list(n = nrow(dat), speed = dat$speed, distance = dat$dist), 
+                 iter = 2000,
+                 chains = 4, cores = 4)
+
+```
+
+## Model assessment & Posterior predictive check
+
+Given the samples from the posterior, we want to check whether our model explained the relationship between the driving speed and stopping distance. First, let's check the parameter estimates and diagnostic statistics.
+
+```{r}
+post1a = extract(fit1a)
+post1b = extract(fit1b)
+post1c = extract(fit1c)
+post1n = extract(fit1_null)
+
+print("Model 1A")
+summary(fit1a, pars = c("beta", "sigma"))$summary
+print("Model 1B")
+summary(fit1b, pars = c("beta", "sigma"))$summary
+print("Model 1C")
+summary(fit1c, pars = c("beta", "sigma"))$summary
+print("Null")
+summary(fit1_null, pars = c("beta", "sigma"))$summary
+```
+
+Next, we can see whether each model's prediction captures the trend in the data well by plotting them. Given the `stanfit` object, you can get the posterior samples by `extract(stanfit_object)`. This function returns a list consisting of posterior samples for each parameter. In our case, we sampled the values of `beta`, `sigma`, `log_lik` (log predictive density of each data point), and `lp__` (log posterior density of each parameter sample).
+
+You can generate the mean trend prediction by using `extract(stanfit_object)$beta[,1]` as an intercept and `extract(stanfit_object)$beta[,2]` as slope. I also calculated the 95% predictive intervals of data by considering observation noise `sigma`.
+
+```{r fig.height=10, fig.width=7}
+
+# Mean trend + Predictive intervals
+## For simplicity, we will generate a plot using the first 500 samples
+
+## Model 1A
+n.sample = dim(post1a$beta)[1]
+idx.samples = 1:500
+temp.speed = seq(0, 30, 0.1)
+pred1a.mean = t(sapply(temp.speed, function(x) post1a$beta[idx.samples,1] + post1a$beta[idx.samples,2] * x))
+pred1a.meanrange = t(apply(pred1a.mean, 1,function(x) c(max(x), min(x))))
+pred1a.ub = sapply(idx.samples, function(x) pred1a.mean[,x] + 1.96 * post1a$sigma[x])
+pred1a.lb = sapply(idx.samples, function(x) pred1a.mean[,x] - 1.96 * post1a$sigma[x])
+
+## Model 1B
+pred1b.mean = t(sapply(temp.speed, function(x) post1b$beta[idx.samples,1] + post1b$beta[idx.samples,2] * x))
+pred1b.meanrange = t(apply(pred1b.mean, 1,function(x) c(max(x), min(x))))
+pred1b.ub = sapply(idx.samples, function(x) pred1b.mean[,x] + 1.96 * post1b$sigma[x])
+pred1b.lb = sapply(idx.samples, function(x) pred1b.mean[,x] - 1.96 * post1b$sigma[x])
+
+## Model 1C
+pred1c.mean = t(sapply(temp.speed, function(x) exp(post1c$beta[idx.samples,1]) + post1c$beta[idx.samples,2] * x))
+pred1c.meanrange = t(apply(pred1c.mean, 1,function(x) c(max(x), min(x))))
+pred1c.ub = sapply(idx.samples, function(x) pred1c.mean[,x] + 1.96 * post1c$sigma[x])
+pred1c.lb = sapply(idx.samples, function(x) pred1c.mean[,x] - 1.96 * post1c$sigma[x])
+
+
+# Plot
+layout(matrix(c(1,2,3,
+                4,4,4), 2, 3, T), heights = c(0.33, 0.66))
+plot(NULL, xlim = c(0, 30), ylim = c(-50, 150), 
+     xlab = "Speed", ylab = "Distance to stop",
+     main = "Model 1A")
+matlines(temp.speed, pred1a.mean, type = "l", 
+        lty = 1, col = rgb(0,0,0,0.1))
+lines(temp.speed, apply(pred1a.mean, 1, mean), type = "l", lty = 1, lwd = 3, col = "red")
+lines(temp.speed, apply(pred1a.ub, 1, max), type="l", lty = 2, col = "grey")
+lines(temp.speed, apply(pred1a.lb, 1, min), type="l", lty = 2, col = "grey")
+points(dat$speed, dat$dist, pch = 21, bg = 3, col = "white", cex = 1.5)
+
+plot(NULL, xlim = c(0, 30), ylim = c(-50, 150), 
+     xlab = "Speed", ylab = "Distance to stop",
+     main = "Model 1B")
+matlines(temp.speed, pred1b.mean, type = "l", 
+        lty = 1, col = rgb(0,0,0,0.1))
+lines(temp.speed, apply(pred1b.mean, 1, mean), type = "l", lty = 1, lwd = 3, col = "blue")
+lines(temp.speed, apply(pred1b.ub, 1, max), type="l", lty = 2, col = "grey")
+lines(temp.speed, apply(pred1b.lb, 1, min), type="l", lty = 2, col = "grey")
+points(dat$speed, dat$dist, pch = 21, bg = 3, col = "white", cex = 1.5)
+
+plot(NULL, xlim = c(0, 30), ylim = c(-50, 150), 
+     xlab = "Speed", ylab = "Distance to stop",
+     main = "Model 1C")
+matlines(temp.speed, pred1c.mean, type = "l", 
+        lty = 1, col = rgb(0,0,0,0.1))
+lines(temp.speed, apply(pred1c.mean, 1, mean), type = "l", lty = 1, lwd = 3, col = 3)
+lines(temp.speed, apply(pred1c.ub, 1, max), type="l", lty = 2, col = "grey")
+lines(temp.speed, apply(pred1c.lb, 1, min), type="l", lty = 2, col = "grey")
+points(dat$speed, dat$dist, pch = 21, bg = 3, col = "white", cex = 1.5)
+
+plot(NULL, xlim = c(0, 30), ylim = c(-50, 150), 
+     xlab = "Speed", ylab = "Distance to stop",
+     main = "Comparing model predictions")
+lines(temp.speed, apply(pred1a.mean, 1, mean), type = "l", lty = 1, lwd = 3, col = "red")
+polygon(c(temp.speed, rev(temp.speed)),
+        c(pred1a.meanrange[,1], rev(pred1a.meanrange[,2])), 
+        col = rgb(1,0,0,0.2), border = NA)
+lines(temp.speed, apply(pred1a.ub, 1, max), type="l", lty = 2, col = "red")
+lines(temp.speed, apply(pred1a.lb, 1, min), type="l", lty = 2, col = "red")
+
+lines(temp.speed, apply(pred1b.mean, 1, mean), type = "l", lty = 1, lwd = 3, col = "blue")
+polygon(c(temp.speed, rev(temp.speed)),
+        c(pred1b.meanrange[,1], rev(pred1b.meanrange[,2])), 
+        col = rgb(0,0,1,0.2), border = NA)
+lines(temp.speed, apply(pred1b.ub, 1, max), type="l", lty = 2, col = "blue")
+lines(temp.speed, apply(pred1b.lb, 1, min), type="l", lty = 2, col = "blue")
+points(dat$speed, dat$dist, pch = 21, bg = 3, col = "white", cex = 1.5)
+
+lines(temp.speed, apply(pred1c.mean, 1, mean), type = "l", lty = 1, lwd = 3, col = 3)
+polygon(c(temp.speed, rev(temp.speed)),
+        c(pred1c.meanrange[,1], rev(pred1c.meanrange[,2])), 
+        col = rgb(0,0,1,0.2), border = NA)
+lines(temp.speed, apply(pred1c.ub, 1, max), type="l", lty = 2, col = 3)
+lines(temp.speed, apply(pred1c.lb, 1, min), type="l", lty = 2, col = 3)
+points(dat$speed, dat$dist, pch = 21, bg = 3, col = "white", cex = 1.5)
+
+legend("topleft", inset = 0.01,
+       lty = c(1, NA, 2, NA, NA, NA), pch = c(NA, 15, NA, 15, 15, 15), 
+       col = c("grey", "grey", "grey", "red", "blue", 3), pt.cex = c(NA, 2, NA, 2, 2, 2),
+       c("Mean estimate: Mean trend", "Posterior range: Mean trend", "95% predictive intervals", 
+         "Model 1A", "Model 1B", "Model 1C"))
+```
+
+All three models capture the mean trend and actual observed range of the data reasonably. Compared to Models 1A and 1B, Model 1C produces predictions around zero at speed = 0. The posterior of all models produce constrained predictions than their priors.
+
+### A quick side note on sensitivity analysis
+
+I didn't intend to compare Model 1A with Model 1B directly. You can imagine two parallel universes. In one universe, you just go with unbounded normal priors, pursuing unbalancedness in numbers. In the other universe, you want to incorporate minimal background knowledge and go with a lognormal prior on the slope parameter. People in different universes will work with different prior assumptions on their models. The observation model is not fundamentally different (it is just a simple linear regression model), and therefore, Models 1A and 1B are not meant to be formally compared (using the Bayes factor, WAIC, etc.).
+
+However, you can also think Models 1A and 1B as a way of evaluating whether your model is sensitive to prior specification. If your dataset is not very informative from the beginning or your model has some issues and cannot incorporate information from your dataset, the model fitting result will be heavily influenced by priors. However, both the parameter estimates and posterior predictive check show that different priors do not make qualitatively distinctive explanations of the data. Consider the similarity in the estimates and predictions between the two models even though Model 1B is strongly constrained to have a positive slope parameter, unlike Model 1A.
+
+The robustness of Bayesian inference is often evaluated by using multiple different priors. This procedure is called **sensitivity analysis**. In our case, the inference made by the two models is robust regardless of critical differences in priors, suggesting that your dataset is informative and your model can learn from data.
+
+## Model comparison
+
+### With respect to a *null* model
+
+In the frequentist procedure for regression modeling, you often perform an F-test to validate your model compared to the *null* model in which the gramd mean explains everything (or more broadly, compared to any reduced or more complex models). Limiting our discussion to the comparison with the null model, the F-statistics for this test, $F^*$, and the distribution that $F^*$ is assumed to follow are given as follows:
+
+$$F^* = \frac{\big[\sum (y_i - \bar{y})^2 - \sum \{y_i - (\beta_0 + \mathbf{X}\beta)\}^2\big] / \{(n-1) - (n-p-1)\}}{\hat{\sigma}^2} \sim F_{p, n-p-1.}$$
+
+Our Bayesian procedure does not do the F-test. Instead, this question of 'overall significance' can be approached as a model comparison problem. We simply evaluate the Bayes factor favoring our model compared to the null model.
+
+```{r}
+ml.1a = bridge_sampler(fit1a)
+ml.1b = bridge_sampler(fit1b)
+ml.1c = bridge_sampler(fit1c)
+ml.1_null = bridge_sampler(fit1_null)
+
+print(bayes_factor(ml.1a, ml.1_null))
+print(bayes_factor(ml.1b, ml.1_null))
+print(bayes_factor(ml.1c, ml.1_null))
+```
+
+### Savage-Dickey density ratio: Is $\beta=0$ or $\beta \neq 0$?
+
+Whether your regression coefficient estimates are "significantly" different from zero (or any other reference value you want) is another question frequently asked in regression modeling. This can be addressed as a model comparison problem. Say we're interested in comparing two models representing two hypotheses, one assuming that the regression coefficient $\beta_1$ is strictly zero and the other assuming $\beta_1 \neq 0$. $$H_0: \beta_1 = 0, \qquad H_1: \beta_1 \neq 0.$$ (I intentionally used $H$ instead of $M$ not to confuse with models that we actually fitted.)
+
+It is known that the Bayes factor favoring $H_1$ over $H_0$ is obtained by calculating the ratio between the prior and posterior density of $\beta_1$ at 0. This way of evaluating the Bayes factor for a **point null hypothesis** is known as the **Savage-Dickey density ratio**: $$BF_{10} = \frac{f(\theta=0)}{f(\theta = 0 | \text{data})} = \frac{\text{Prior density of }\theta = 0}{\text{Posterior density of }\theta = 0}.$$ Positive $BF_{10}$ supports $M_1$, and vice versa.
+
+Let's evaluate whether the intercept $\beta_0$ and slope $\beta_1$ are not equal to zero. You can compute the posterior density of $\theta = 0$ using several methods. Grid approximation of the posterior distribution is one approach. However, we have samples from the full posterior distribution with rich information, so why don't we use them? You can estimate the posterior density function using non-parametric density estimation methods, e.g., kernel density estimation or [logspline density estimation](https://www.sciencedirect.com/science/article/abs/pii/016794739190115I). I will demonstrate an approach using logspline density estimation.
+
+```{r}
+# Extract the samples
+post1a = extract(fit1a)
+################################################################################
+# Intercept
+## Estimate the posterior density function from the samples
+f.post.beta0 = logspline(post1a$beta[,1])
+
+## Evaluate the Savage-Dickey density ratio
+dens.post.beta0 = dlogspline(0, f.post.beta0) # posterior density of intercept = 0
+dens.prior.beta0 = dnorm(0, 0, 10)
+sddr.beta0 = dens.prior.beta0/dens.post.beta0
+
+# Slope
+## Estimate the posterior density function from the samples
+f.post.beta1 = logspline(post1a$beta[,2])
+
+## Evaluate the Savage-Dickey density ratio
+dens.post.beta1 = dlogspline(0, f.post.beta1) # posterior density of intercept = 0
+dens.prior.beta1 = dnorm(0, 0, 10)
+sddr.beta1 = dens.prior.beta0/dens.post.beta1
+
+################################################################################
+# Visualize
+par(mfrow = c(1,2))
+hist(post1a$beta[,1], main = "Intercept", xlab = "Value", col = rgb(1,0,0,0.1), freq = F)
+lines(seq(-50, 20, 0.01), dlogspline(seq(-50, 20, 0.01), f.post.beta0), col = "red", lwd = 2)
+lines(seq(-50, 20, 0.01), dnorm(seq(-50, 20, 0.01), 0, 10), col = "darkgrey", lwd = 2)
+points(x = 0, y = dlogspline(0, f.post.beta0), pch = 16, cex = 1.5, col = "red")
+points(x = 0, y = dnorm(0, 0, 10), pch = 16, cex = 1.5, col = "darkgrey")
+text(x = 0, y = dnorm(0, 0, 10), paste("SDDR=", round(sddr.beta0, 2), sep=""), pos = 3)
+
+hist(post1a$beta[,2], main = "Slope", xlab = "Value", col = rgb(1,0,0,0.1), freq = F, xlim = c(0, 6))
+lines(seq(0, 6, 0.01), dlogspline(seq(0, 6, 0.01), f.post.beta1), col = "red", lwd = 2)
+lines(seq(0, 6, 0.01), dnorm(seq(0, 6, 0.01), 0, 10), col = "darkgrey", lwd = 2)
+points(x = 0, y = dlogspline(0, f.post.beta1), pch = 16, cex = 1.5, col = "red")
+points(x = 0, y = dnorm(0, 0, 10), pch = 16, cex = 1.5, col = "darkgrey")
+text(x = 0, y = dnorm(0, 0, 10) * 1.5, paste("SDDR=", round(sddr.beta1, 2), sep=""), pos = 4)
+```
+
+# Case 2: Fitting psychophysical functions
+
+So far, we have only discussed models with Gaussian likelihood. However, many real-world data such as choices on a nominal scale, counts, ordered responses on a Likert scale cannot be modeled using Gaussian likelihood because it fundamentally violates fundamental assumptions on the data-generating processes. Counts are not continuous values nor are negative. The difference of 1 point in confidence rating cannot be simply mapped onto the same difference in physical quantities.
+
+As an example, I will briefly demonstrate how to fit a psychophysical function to count data that have a limited range. We cannot cover all non-Gaussian regression models, but I will introduce some representative cases and Stan's features that make modeling non-Gaussian observations easier.
+
+We will keep this case study simple, covering model specification and predictive checks only.
+
+## Dataset
+
+-   The dataset is from Chapter 12 of [Lee & Wagenmakers (2013)](https://bayesmodels.com/). The original book chapter discusses hierarchical modeling of psychophysical functions across eight subjects. For now, I will just focus on fitting the model to the data from a single participant.
+
+-   In this experiment, two beeps of different duration were presented as stimuli. The standard stimulus lasted 300 ms. The test stimulus was of variable duration, ranging from 200 ms to 400 ms. Participants were asked to respond whether the test stimulus was shorter or longer than the standard stimulus.
+
+## Binomial regression
+
+The dataset has three variables:
+
+-   `x`: The duration of a test stimulus;
+-   `n`: The number of trials for each stimulus intensity;
+-   `r`: The number of response that the test stimulus was longer than the standard stimulus.
+
+At each stimulus intensity, the number of "longer" responses is limited between 0 and the number of trials assigned to that stimulus intensity. This process can be modeled using a binomial distribution.
+
+$$r_i \sim \text{Binomial}(n_i, p_i)\\ \text{where }p_i = f^{-1}\big(\beta_0 + \beta_1 (x_i - \bar{x})\big),\quad \bar{x} = \frac{1}{n_T}\sum_{j=1}^{n_T} x_j$$ where $n_T$ is the total number of stimulus intensity levels.
+
+$\beta_0 + \beta_1 (x_i - \bar{x})$ cannot serve as a probability value because its values are unbounded. We want $\beta_0 + \beta_1 (x_i - \bar{x})$ to be bound within $[0,1]$, and logistic transformation is an easy way to achieve this: $$f^{-1}(z) = \frac{1}{1+\exp(-z)}.$$ Conventionally, this transformation is also called *inverse logit*, and Stan has a function `inv_logit`.
+
+This model has two parameters: An intercept term $\beta_0$ and a slope term $\beta_1$. We will use the following priors: $$\beta_0 \sim N(0, 5^2), \qquad \beta_1 \sim N(0, 0.05^2)$$
+
+```{r}
+dat.pp = data.frame(
+  x = c(200, 220, 240, 260, 270, 275, 280, 285, 290, 295, 300, 305, 310, 330, 335, 340, 345, 350, 355, 360, 365, 370, 375, 380, 385, 390, 400),
+  n = c(6, 6, 6, 6, 6, 4, 16, 19, 17, 9, 9, 11, 5, 5, 6, 24, 13, 16, 4, 9, 6, 8, 6, 11, 2, 2, 8),
+  r = c(0, 0, 0, 0, 0, 0, 2, 4, 4, 3, 1, 2, 3, 0, 3, 17, 9, 13, 4, 6, 4, 6, 5, 8, 2, 2, 8)
+)
+
+plot(dat.pp$x, dat.pp$r / dat.pp$n, pch = 21, col = "white", bg = 3,
+     main = "Psychophysics experiment", xlab = "Duration: Test stimulus (ms)", ylab = "P('longer' resposne)")
+```
+
+```{r}
+m2.statement = "
+data {
+  int nT; // the total number of stimulus intensity levels
+  int n[nT]; // the number of trials for each stimulus intensity level
+  int r[nT]; // the number of 'longer' responses
+  real x[nT]; // stimulus intensity levels
+}
+
+parameters {
+  vector[2] beta;
+}
+
+transformed parameters{
+  vector[nT] p;
+  for (i in 1:nT){
+    p[i] <- inv_logit(beta[1] + beta[2] * (x[i] - mean(x)));
+  }
+}
+
+model {
+  for (i in 1:nT){
+    r[i] ~ binomial(n[i], p[i]);
+  }
+  beta[1] ~ normal(0, 5);
+  beta[2] ~ normal(0, 0.05);
+}
+"
+
+model2 = stan_model(model_code = m2.statement)
+fit2 = sampling(model2, 
+                 data = list(nT = nrow(dat.pp), n = dat.pp$n, r = dat.pp$r, x = dat.pp$x), 
+                 iter = 2000,
+                 chains = 4, cores = 4)
+post2 = extract(fit2)
+```
+
+```{r}
+temp.x.prior = sapply(1:1000, function(x) rnorm(1, 0, 5) + rnorm(1, 0, 0.05) * (seq(200, 400, 1) - mean(dat.pp$x)))
+p.prior.pred = 1 / (1 + exp(-temp.x.prior))
+
+temp.x.post = sapply(1:1000, function(x) post2$beta[x,1] + post2$beta[x,2] * (seq(200, 400, 1) - mean(dat.pp$x)))
+p.post.pred = 1 / (1 + exp(-temp.x.post))
+
+par(mfrow = c(1,2))
+matplot(200:400, p.prior.pred, type="l", lty = 1, col = rgb(0,0,0,0.05), 
+        xlab = "Time (msec)", ylab = "Probability", main = "Prior")
+lines(200:400, apply(p.prior.pred, 1, mean), col = "red", lwd = 3)
+matplot(200:400, p.post.pred, type="l", lty = 1, col = rgb(0,0,0,0.05),
+        xlab = "Time (msec)", ylab = "Probability", main = "Posterior")
+lines(200:400, apply(p.post.pred, 1, mean), col = "red", lwd = 3)
+points(dat.pp$x, dat.pp$r / dat.pp$n, pch = 21, col = "white", bg = 3)
+```
+
+## Generalized linear modeling, in general
+
+Generalized linear models connect a linear trend predicted as a linear combination of predictor variables to parameters governing non-Gaussian observations, such as a probability or occurrence rate of a target event. These quantities with a limited range must be transformed somehow into an unbounded variable for linear modeling. A function that links the target quantity (e.g., probability, rate) governing non-Gaussian observations to a linear combination of predictor variables is called a **link** function. In other words, you can transform a linear combination of predictor variables into parameters for non-Gaussian observations by using an **inverse link** function.
+
+Stan offers functions for generalized linear models. They are not limited to (inverse) link functions; Stan even provides some pre-set functions that combine observation models and their appropriate link functions. I strongly recommend that you consult [Stan Functions Reference](https://mc-stan.org/docs/functions-reference/). I will briefly introduce a few representative generalized linear models and related Stan functions.
+
+-   **Bernoulli/binomial regression** for upper-bounded count data
+    -   Link and inverse link functions for logistic regression: `logit` and `inv_logit`, `inv_Phi` and `Phi`[^1]
+    -   Preset: `bernoulli_logit_glm`, `binomial_logit_glm`
+-   **Poisson** and **negative-binomial distribution** for unbounded count data
+    -   Link and inverse link functions: `log` and `exp`
+    -   Preset: `poisson_log_glm`, `neg_binomial_2_log_glm`
+-   **Softmax regression** for nominal discrete responses
+    -   Distribution: `categorical`, `categorical_logit`
+    -   Special functions: `softmax`, `log_softmax`
+    -   Preset: `categorical_logit_glm`
+-   **Ordinal regression** for ordered discrete responses (e.g., confidence rating)
+    -   Distribution: `ordered_logistic`, `ordered_probit`
+    -   Preset: `ordered_logistic_glm`
+
+[^1]: Link and inverse link functions for probit regression. `Phi` is the cumulative distribution function for a standard normal distribution, and `inv_Phi` is an inverse function of `Phi`.

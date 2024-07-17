@@ -1,0 +1,123 @@
+---
+title: "Bayesian Workshop Week 4a: Side notes"
+output: html_notebook
+---
+
+```{r}
+library("rstan")
+library("trialr")
+```
+
+# Partial Correlation
+
+Let's say that a researcher uploaded a preprint (that will probably never be published) about the relationship between the sales rate of ice cream and the (log-transformed) frequency of assault crime. The reported correlation between the two was about 0.6, which cannot be easily ignored. This study implies that people should not eat ice cream because it triggers violence.
+
+However, you can easily imagine a few confounding variables. For example, people eat ice cream a lot in summer days. It is usually hot and humid in summer days. People can get irritated so easily in this situation, which can lead to violence. So, for example, we might want to rule out the impact of the temperature or humidity. You were able to get the temperature data.
+
+## Simulate data
+```{r fig.height=8, fig.width=8}
+################################################################################
+n.data = 100
+beta0.Arate = 0.1
+beta1.Arate = 1.5
+beta2.Arate = 0
+sigma.Arate = 0.3
+beta0.IC = 0
+beta1.IC = 1.5
+beta2.IC = 0
+sigma.IC = 0.5
+
+set.seed(11)
+# Temperature (centered)
+Temp.centered = runif(n.data, -1, 1)
+
+# If you want, you can also add unobserved variables
+# affecting assault crime or sales rate of ice cream exclusively.
+U.Arate = rnorm(n.data, 0, 1)
+U.IC = rnorm(n.data, 0, 1)
+
+# Frequency of assault crime
+log.Arate = beta0.Arate + beta1.Arate * Temp.centered + beta2.Arate * U.Arate + rnorm(n.data, 0, sigma.Arate)
+A = rpois(n.data, exp(log.Arate)) + 1
+log.A = log(A)
+
+# Sales rate of ice cream
+IC.centered = beta0.IC + beta1.IC * Temp.centered + beta2.IC * U.IC + rnorm(n.data, 0, sigma.IC)
+IC = (IC.centered - mean(IC.centered)) / sd(IC.centered)
+
+# Dataset
+dat = cbind(Temp.centered, log.A, IC)
+
+## Plot
+pairs(dat, pch = 16, col = rgb(0,0,0,0.3), cex = 1.5)
+```
+
+## Model
+
+Let's model the correlation between the three variables of our consideration.
+
+```{r}
+m2.statement = "
+data {
+  int N;
+  matrix[N, 3] dat; // Temp.centered, log(A), IC
+}
+
+parameters {
+  cholesky_factor_corr[3] L;
+  vector[3] mus;
+  vector<lower = 0>[3] sigmas;
+}
+
+model {
+  matrix[3,3] Sigma;
+  Sigma <- quad_form_sym(L * L', diag_matrix(sigmas));
+  
+  for (i in 1:N){
+    dat[i,:] ~ multi_normal(mus, Sigma);
+  }
+  
+  L ~ lkj_corr_cholesky(2);
+  mus ~ normal(0, 2);
+  sigmas ~ inv_gamma(0.01, 0.01);
+}
+"
+
+model2 = stan_model(model_code = m2.statement)
+fit2 = sampling(model2, 
+                data = list(N = length(A), dat = cbind(Temp.centered, log(A), IC)), 
+                iter = 10000, chains = 4, cores = 4)
+post2 = extract(fit2)
+```
+
+## Correlation vs. Partial correlation
+
+Given three variables $X$, $Y$, and $Z$, partial correlation between $X$ and $Y$ ruling out the effect of $Z$ can be calculated as follows:
+$$\rho_{XY\cdot Z} = \frac{\rho_{XY} - \rho_{XZ} \rho_{YZ}}{\sqrt{1-\rho_{XZ}^2}\sqrt{1-\rho_{YZ}^2}}.$$
+
+In our case, $X$ and $Y$ are the sales rate of ice cream and the frequency of assault crime. $Z$ is the temperature.
+
+```{r}
+R.post = array(NA, c(nrow(post2$sigmas), 3, 3))
+
+# I'm running through a for loop
+# just to clarify how to calculate partial correlation.
+rho.partial.vec = vector()
+for (i in 1:nrow(post2$sigmas)){
+  R.post[i,,] = post2$L[i,,] %*% t(post2$L[i,,])
+  rho.partial.vec[i] = (R.post[i,2,3] - R.post[i,1,2] * R.post[i,1,3]) / (sqrt(1 - R.post[i,1,2]^2) * sqrt(1 - R.post[i,1,3]^3))
+}
+
+# Prior for correlation
+temp.prior = rlkjcorr(1e+5, 2, 2)
+```
+
+```{r fig.height=5, fig.width=8}
+plot(density(R.post[,2,3]), xlim = c(-1, 1), col = "black", lwd = 3,
+     main = "Correlation(log(A), IC)", xlab = "Correlation")
+lines(density(rho.partial.vec), col = "purple", lwd = 3)
+lines(density(temp.prior[,1,2]), col = "grey", lwd = 1)
+legend("topleft", inset = 0.01,
+       col = c("black", "purple", "grey"), lwd = c(3, 3, 1),
+       c("Correlation", "Partial correlation", "LKJ Prior (eta = 2)"))
+```
