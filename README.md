@@ -14,4 +14,4 @@ A repository for R markdown notebooks used in the hands-on Bayesian inference wo
      * The LKJ distribution as a prior for correlation matrices
      * The Cholesky decomposition
      * Partial correlation
- * Week 6 (08/13/2024): Power analysis
+ * Week 5 (08/13/2024): Power analysis
