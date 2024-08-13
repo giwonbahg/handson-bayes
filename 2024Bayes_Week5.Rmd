@@ -1,0 +1,175 @@
+---
+title: "Bayesian Workshop Week 5"
+output: html_notebook
+---
+
+```{r}
+library("truncnorm")
+library("vioplot")
+library("devtools")
+install_github("nicebread/BFDA", subdir="package")
+```
+
+# Power analysis from a Bayesian perspective
+
+## References
+
+-   Kruschke, J. (2015). Doing Bayesian data analysis: A tutorial with R, JAGS, and Stan (2nd ed.). Academic Press.
+-   Schönbrodt, F., & Wagenmaker, E.-J. (2018). Bayes factor design analysis: Planning for compelling evidence. Psychonomic Bulletin & Review, 25, 125-142.
+-   Park, J., & Pek, J. (2023). Conducting Bayesian-Classical Hybrid Power Analysis with R Package Hybridpower. Multivariate Behavioral Research, 58, 543-559.
+
+## "Power"
+
+In classical frequentist statistical procedures, power is the probability that we reject the null hypothesis ($H_0$) when the null hypothesis is actually false. This is equivalent to $1-\text{(Type II error rate)}$.
+
+Statistical power is determined by interactions between (1) effect size, (2) sample size, and (3) significance level (i.e., Type I error rate). If we know three among the four, we can derive the remaining one -- this procedure is called a **power analysis**. As the significance level is typically fixed ($\alpha = 0.05$ or $0.01$) in many research domains, the questions of our interest are often narrowed down to the followings:
+
+1.  Given a fixed sample size and the expected effect size, how much power is expected?
+2.  Given the expected effect size and statistical power, how many participants are needed?
+
+The aforementioned procedure is centered around p-values and hypothesis testing. However, different approaches for sample size determination have been discussed based on the precision of parameter estimates (e.g., accuracy in parameter estimation or AIPE; [Kelly & Maxwell, 2003](https://psycnet.apa.org/buy/2003-09632-005)).
+
+### "Power" in Bayesian statistics
+
+Statistical power is not a major consideration in Bayesian inference because it does not employ such a binary hypothesis testing procedure. Bayesian hypothesis *testing* is in fact a comparison of the support for two models formalizing different hypotheses, and the resulting Bayes factor is also interpreted in terms of the degree of support.
+
+However, Bayesian analogs of the frequentist power analysis have been proposed. You can set possible goals based on the Bayes factor or credible interval (highest density intervals or HDIs are often recommended). The same questions as above can be asked with Bayesian concepts, including
+
+-   A certain level of the Bayes factor supporing one model over the other;
+-   A certain level of the precision of the posterior parameter estimate.[^1]
+
+[^1]: Kruschke (2015) re-frames the Bayesian approach on power analysis using the credible interval (specifically, the highest density interval or HDI), rather than the Bayes factor. Within this framework, whether a certain value (representing the null result or some sort of 'significance') is excluded from or included in the credible interval can also be questions you can consider for power analysis.
+
+We will focus on the procedure centered around the Bayes factor (Schönbrodt & Wagenmaker, 2018).
+
+### Simulation-based power calculation
+Monte Carlo simulation is broadly used in power analysis to handle complex study designs more flexibly. A typical procedure for simulation-based power analysis is as follows:
+
+ 1. Determine the expected effect size.
+ 2. Generate samples of size $n$.
+ 3. Run a statistical test or fit a model and obtain the quantity required for calculating the power.
+ 4. Repeat 2-3 (say, 1000 or 10000 times).
+ 5. Calculate the power (i.e., the proportion of experiments with satisfactory p-values, Bayes factors, or the width of the credible interval).
+
+### Uncertainty in the effect size
+
+The classic frequentist power analysis assumes a fixed level of statistical power, whether it is one of the conditions we want to satisfy or something to be derived from other pieces of information. However, it is often the case that we do not know what is exactly the appropriate level of effect size to consider. We might want to assume the effect size of 0.5, but the true observable effect size might be lower or higher than that.
+
+Power analysis adapted within a Bayesian framework requires the quantification of this epistemic uncertainty about effect size. A distribution representing the uncertainty about effect size is called a *design* prior, compared to an *analysis* prior or *fitting* prior that we use for data analysis.
+
+Given a distribution of effect sizes, you can get a distribution of quantities required for calculating the "power" (e.g., p-values, Bayes factors, the width of 95% HDIs). Depending on the approach, you can use either the distribution of this quantity directly (e.g., Schönbrodt & Wagenmaker, 2018) or repeat multiple samples from each effect size and compute the power as the probability of success (e.g., Park & Pek, 2023). If you decide to do the latter and get the distribution of power, the expected value of the power is called **assurance** and is considered as a criterion for making any design decision.
+
+## Three exemplary designs for a Bayes factor design analysis
+
+Schönbrodt and Wagenmaker (2018) introduce three design approaches for a Bayes factor design analysis:
+
+ 1. Fixed-$n$ design: You can either determine the sample size based on the expected effect size and Bayes factor, or calculate the expected Bayes factor given the expected effect size and the sample size.
+ 2. Sequential design: You can continue data collection until the Bayes factor reaches a certain level. In that case, what distribution of sample size can be expected?
+ 3. Sequential design with maximal $n$: You take the sequential design approach, but the upper limit of the sample size exists due to realistic constraints.
+
+We will discuss three cases of power analysis introducing the Bayesian-statistics ideas:
+
+ * A Bayesian-classical hybrid method (e.g., Pek & Park, 2019; Park & Pek, 2023), fixed-$n$ design: This approach is largely the same as the frequentist Bayesian analysis but introduces the uncertainty in the effect size and the idea of design priors.
+ * A Bayes-factor-based fixed-$n$ design
+ * A Bayes-factor-based sequential design with maximal $n$
+
+## Fixed-$n$ examples: Independent-sample t-test
+### A Bayesian-classical hybrid method
+In this example, I sampled 1000 effect size values from $N(0.5, 0.1^2)$. For each sample size value, I sampled data and did the t-test for 100 times from which I computed the power. The significance level was set to 0.5.
+
+```{r}
+n.effsize = 1000
+nsample.vec = seq(10, 100, 10)
+effsize.vec = rtruncnorm(n.effsize, a = 0, b = 1, mean = 0.5, sd = 0.1)
+
+n.rep = 100
+
+pval.arr = array(NA, c(n.rep, length(nsample.vec), n.effsize))
+for (idx.nsample in 1:length(nsample.vec)){
+  temp.n = nsample.vec[idx.nsample]
+  for (idx.eff in 1:n.effsize){
+    for (idx.rep in 1:n.rep){
+      dat0 = rnorm(temp.n, 0, 1)
+      dat1 = rnorm(temp.n, effsize.vec[idx.eff], 1)
+      
+      ttest.out = t.test(dat0, dat1,
+                         alternative = "two.sided", mu = 0, 
+                         paired = FALSE, var.equal = FALSE, conf.level = 0.95)
+      pval.arr[idx.rep, idx.nsample, idx.eff] = ttest.out$p.value
+    }
+  }
+}
+```
+
+```{r}
+p.significant = t(apply(pval.arr, c(2,3), function(x) mean(x < 0.05)))
+vioplot(p.significant, names = nsample.vec, main = "P(p < 0.05)", drawRect = F, xlim = c(1, 13))
+lines(1:10, colMeans(p.significant), col = "red")
+points(1:10, colMeans(p.significant), pch = 21, bg = "red", col = "white", cex = 1.5)
+abline(h = 0.8, lty = 2, col = "red")
+legend("bottomright", inset = 0.01, bty = "n",
+       pch = c(15, 16), col = c(rgb(0.4, 0.4, 0.4), "red"), pt.cex = 1.5,
+       c("Power\ndistribution", "Assurance"))
+```
+
+The plot above shows the distribution of power values with different sample sizes. Red dots are the values of assurance (i.e., the mean of the power distribution). The result shows that we need approximately 70 participants to achieve the expected power of 0.8.
+
+### Bayes factor design analysis
+The R package `BFDA` supports the power analysis using the Bayes factor for independent and paired t-tests, Pearson correlation, and A/B testing. In addition to the effect size values, you also need to include the analysis prior for calculating the Bayes factor in the `prior` argument.
+
+```{r}
+BFDA.list = list()
+for (idx.nsample in 1:length(nsample.vec)){
+  BFDA.list[[idx.nsample]] = BFDA.sim(effsize.vec, type = "t.between", 
+         prior = list("Cauchy", list(prior.location = 0, prior.scale = 1/sqrt(2))),
+         n.max = nsample.vec[idx.nsample], design = "fixed.n", verbose = F)
+}
+```
+
+```{r}
+prop.BF10.arr = array(NA, c(length(nsample.vec), 3))
+for (idx.nsample in 1:length(nsample.vec)){
+  prop.BF10.arr[idx.nsample,1] = mean(BFDA.list[[idx.nsample]]$sim$logBF > log(3))
+  prop.BF10.arr[idx.nsample,2] = mean(abs(BFDA.list[[idx.nsample]]$sim$logBF) < log(3))
+  prop.BF10.arr[idx.nsample,3] = mean(BFDA.list[[idx.nsample]]$sim$logBF < log(1/3))
+}
+```
+
+```{r}
+plot(nsample.vec, colMeans(p.significant), pch = 1, col = "red", cex = 1, xaxt="n",
+     xlim = c(10, 130), ylim = c(0, 1),
+     main = "Bayes factor design analysis", xlab = "# samples", ylab = "Proportion")
+axis(1, at = seq(10, 100, 10))
+matlines(nsample.vec, prop.BF10.arr,lty = 1, col = c(3, 4, "grey"))
+matpoints(nsample.vec, prop.BF10.arr, pch = 23, bg = c(3, 4, "grey"), col = "white", cex = 1.5)
+abline(h = 0.8, lty = 2, col = "red")
+legend("bottomright", inset = 0.01, pt.cex = 1.5, bty = "n",
+       pch = c(1, 18, 18, 18), col = c("red", 3,4,"grey"),
+       c("Assurance", "BF > 3", "inconclusive\n(1/3 < BF < 3)", "BF < 1/3"))
+```
+
+## Sequential design example (with maximal $n$)
+Schönbrodt & Wagenmaker (2018) also discussed a variant of the sequential design in which the maximum number of participants is limited, considering practical constraints on time and resources. The sequential-design simulaton takes a significnately more amount of time compared to the fixed-$n$ counterpart, so I will load the simulation results and discuss how to interpret them.
+
+```{r}
+# BFDA.seq = BFDA.sim(effsize.vec, type = "t.between", 
+#                     prior = list("Cauchy", list(prior.location = 0, prior.scale = 1/sqrt(2))),
+#                     n.min = 20, n.max = 200, design = "sequential", verbose = F)
+# save(BFDA.seq, file = "BFDA_sequential_example.Rdata")
+load("BFDA_sequential_example.Rdata")
+```
+
+```{r}
+BFDA.analyze(BFDA.seq, boundary = 3, n.min = 20, n.max = 200)
+```
+The output presents the number of simulation instances that reached one of the decision boundaries or the maximum number of participants. It also calculates the average sample number at stopping point, which you can use as a reference for determining the number of participants.
+
+```{r}
+plot(BFDA.seq, boundary = 3)
+```
+
+```{r}
+plot(BFDA.seq, boundary = 10)
+```
+
+The figure above visualizes the simulated trajectories of the Bayes factors, given a pre-determined symmetric decision boundaries supporting H1 or H0. The decision boundary can be changed by adjusting the argument `boundary`.
