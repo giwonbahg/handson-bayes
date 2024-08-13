@@ -15,3 +15,5 @@ A repository for R markdown notebooks used in the hands-on Bayesian inference wo
      * The Cholesky decomposition
      * Partial correlation
  * Week 5 (08/13/2024): Power analysis
+     * A Bayesian-classical hybrid method (Pek & Park, 2019; Park & Pek, 2023)
+     * Bayes factor design analysis (Schönbrodt & Wagenmaker, 2018)
